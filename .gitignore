@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.venv/
+venv/
+env/
+ENV/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# PostgreSQL and local application data
+postgres-data/
+pgdata/
+data/*
+!data/.gitkeep
+*.sqlite3
+*.db
+
+# Generated research archives and logs
+archives/*
+!archives/.gitkeep
+*.parquet
+*.parquet.gz
+logs/*
+!logs/.gitkeep
+*.log
