@@ -39,6 +39,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = ["integration: requires the local PostgreSQL Docker service"]
 
 [tool.ruff]
 target-version = "py312"
@@ -46,6 +47,9 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"alembic/versions/*.py" = ["E501", "I", "UP"]
 
 [tool.mypy]
 python_version = "3.12"

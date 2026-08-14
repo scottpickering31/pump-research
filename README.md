@@ -54,7 +54,7 @@ Each phase requires approval. Cadence and retention decisions remain provisional
 
 ## Current status
 
-Phase 1 is complete. The repository provides a Python 3.12+ development foundation, typed environment configuration, structured logging, a PostgreSQL-only local Docker Compose service, and a database health-check command. It intentionally contains no API integrations, database models or migrations, discovery, lifecycle logic, polling scheduler, or collector.
+Phase 2 is complete. The repository provides the Python development foundation plus PostgreSQL models, an applied Alembic migration, repository abstractions, integration tests, and database design documentation. It intentionally contains no API integrations, discovery implementation, lifecycle heuristics, polling scheduler, or collector.
 
 ## Local development setup
 
@@ -68,13 +68,14 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 docker compose up -d
 docker compose ps
+python -m alembic upgrade head
 python -m pump_research database health
 python -m pytest
 python -m ruff check .
 python -m mypy
 ```
 
-`docker compose ps` reports `healthy` after PostgreSQL passes its health check. The database uses the named `postgres_data` Docker volume and therefore persists across container recreation. For convenience, equivalent commands are available through `make db-up`, `make db-status`, `make db-health`, and `make check` once the virtual environment exists.
+`docker compose ps` reports `healthy` after PostgreSQL passes its health check. The database uses the named `postgres_data` Docker volume and therefore persists across container recreation. Apply database migrations with `make migrate`. For convenience, equivalent commands are available through `make db-up`, `make db-status`, `make db-health`, and `make check` once the virtual environment exists.
 
 Copy `.env.example` to `.env` for local overrides. `.env` is ignored by Git; never commit credentials or connection strings for shared environments.
 
@@ -88,7 +89,8 @@ The default host port is `5433` because many local PostgreSQL installations alre
 ├── README.md
 ├── .gitignore
 ├── docs/
-│   └── architecture.md      # durability and research-integrity design
+│   ├── architecture.md      # durability and research-integrity design
+│   └── database.md          # persistence schema, indexes, and scale notes
 ├── src/
 │   └── pump_research/
 │       ├── domain/          # provider-neutral identities and contracts
@@ -96,12 +98,12 @@ The default host port is `5433` because many local PostgreSQL installations alre
 │       ├── logging.py       # structured logging setup
 │       ├── database.py      # async engine and health check only
 │       ├── cli.py           # `database health` command
+│       ├── persistence/     # SQLAlchemy models and repository abstractions
 │       ├── discovery/       # replaceable token-discovery adapters
 │       ├── market_data/     # provider-specific market-data clients
 │       ├── collection/      # batching, rate budgets, attempt orchestration
 │       ├── scheduling/      # durable due-work and lease coordination
 │       ├── lifecycle/       # derived state and versioned transitions
-│       ├── persistence/     # repositories and transaction boundaries
 │       ├── archival/        # verified Parquet archival and manifests
 │       ├── reporting/       # as-of data-quality/collection reports
 │       └── monitoring/      # health, metrics, and gap detection
@@ -109,11 +111,11 @@ The default host port is `5433` because many local PostgreSQL installations alre
 │   ├── unit/
 │   ├── integration/
 │   └── fixtures/
-├── alembic/                 # future schema migrations only
+├── alembic/                 # migration environment and revision history
 ├── scripts/                 # explicit operational commands only
 ├── data/                    # untracked local development data
 ├── archives/                # untracked generated Parquet output
 └── logs/                    # untracked local logs
 ```
 
-The placeholder directories are intentionally empty until their corresponding phase is approved.
+Directories without source files remain intentional placeholders until their corresponding phase is approved.

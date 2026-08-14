@@ -24,7 +24,10 @@ def create_database_engine(settings: Settings) -> AsyncEngine:
     """Create an async PostgreSQL engine without opening a connection."""
     return create_async_engine(
         settings.database_url,
-        connect_args={"timeout": settings.database_connect_timeout_seconds},
+        connect_args={
+            "timeout": settings.database_connect_timeout_seconds,
+            "server_settings": {"timezone": "UTC"},
+        },
         pool_pre_ping=True,
     )
 

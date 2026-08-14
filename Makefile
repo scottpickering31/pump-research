@@ -1,6 +1,6 @@
 PYTHON ?= .venv/bin/python
 
-.PHONY: install db-up db-down db-status db-health test lint typecheck check
+.PHONY: install db-up db-down db-status migrate db-health test lint typecheck check
 
 install:
 	$(PYTHON) -m pip install --upgrade pip
@@ -14,6 +14,9 @@ db-down:
 
 db-status:
 	docker compose ps
+
+migrate:
+	$(PYTHON) -m alembic upgrade head
 
 db-health:
 	$(PYTHON) -m pump_research database health
