@@ -54,9 +54,11 @@ Each phase requires approval. Cadence and retention decisions remain provisional
 
 ## Current status
 
-Phase 2 persistence is complete, and the DEX Screener market-data client has been implemented ahead of discovery. It provides the Python/PostgreSQL foundation, migrations, repository abstractions, an official-contract async DEX Screener batch client, and tests. Discovery implementation, lifecycle heuristics, polling scheduler, and collector orchestration remain intentionally absent.
+Phase 2 persistence is complete. The DEX Screener market-data client and Phase 3 discovery boundary are implemented. Discovery consumers receive provider-neutral canonical token events; the initial Pump.fun latest-coin adapter is explicitly best-effort, rather than claiming complete coverage. Lifecycle heuristics, polling scheduler, durable checkpoint hand-off, and collector orchestration remain intentionally absent.
 
 The DEX Screener client follows the current official [`/tokens/v1` API reference](https://docs.dexscreener.com/api/reference): 30-address batches, a 300-RPM documented endpoint limit, and a 240-RPM default client budget. See [docs/dexscreener.md](docs/dexscreener.md).
+
+See [docs/discovery.md](docs/discovery.md) for the provider-neutral discovery contract and the important coverage limitation of the initial Pump.fun adapter.
 
 ## Local development setup
 
@@ -93,7 +95,8 @@ The default host port is `5433` because many local PostgreSQL installations alre
 ├── docs/
 │   ├── architecture.md      # durability and research-integrity design
 │   ├── database.md          # persistence schema, indexes, and scale notes
-│   └── dexscreener.md       # official API contract and client policy
+│   ├── dexscreener.md       # official API contract and client policy
+│   └── discovery.md         # discovery contract and coverage semantics
 ├── src/
 │   └── pump_research/
 │       ├── domain/          # provider-neutral identities and contracts
@@ -103,7 +106,7 @@ The default host port is `5433` because many local PostgreSQL installations alre
 │       ├── cli.py           # `database health` command
 │       ├── persistence/     # SQLAlchemy models and repository abstractions
 │       ├── market_data/     # DEX Screener client, parsing, rate limiting
-│       ├── discovery/       # replaceable token-discovery adapters
+│       ├── discovery/       # provider-neutral contract and replaceable adapters
 │       ├── collection/      # batching, rate budgets, attempt orchestration
 │       ├── scheduling/      # durable due-work and lease coordination
 │       ├── lifecycle/       # derived state and versioned transitions

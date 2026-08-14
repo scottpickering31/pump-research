@@ -100,4 +100,11 @@ Files are published atomically and independently read back before a manifest bec
 
 ## Decisions intentionally deferred
 
-Phase 0 does not choose table definitions, partition interval, polling thresholds, archive retention, a discovery provider, or exact DEX Screener endpoints. Those decisions require verified provider contracts, expected volume, storage budget, and operational recovery objectives.
+The initial persistence schema, DEX Screener endpoint, and a deliberately
+best-effort Pump.fun latest-coin adapter are now implemented. The adapter does
+not establish complete discovery coverage: it has no replayable cursor and its
+coverage limitation must appear in later data-quality reporting. Partition
+interval, polling thresholds, archive retention, a production-grade
+cursorable/replayable discovery source, and exact collection recovery policies
+remain deferred until verified provider contracts, expected volume, storage
+budget, and operational recovery objectives are available.
