@@ -54,7 +54,31 @@ Each phase requires approval. Cadence and retention decisions remain provisional
 
 ## Current status
 
-Phase 0 is complete: this repository contains project guidance, an architecture note, a proposed directory layout, and ignore rules only. It intentionally contains no application implementation, dependency lockfiles, API integrations, database models, migrations, Docker configuration, or collector.
+Phase 1 is complete. The repository provides a Python 3.12+ development foundation, typed environment configuration, structured logging, a PostgreSQL-only local Docker Compose service, and a database health-check command. It intentionally contains no API integrations, database models or migrations, discovery, lifecycle logic, polling scheduler, or collector.
+
+## Local development setup
+
+Prerequisites: Python 3.12+ and Docker Desktop (including Docker Compose).
+
+```bash
+cp .env.example .env
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[dev]'
+docker compose up -d
+docker compose ps
+python -m pump_research database health
+python -m pytest
+python -m ruff check .
+python -m mypy
+```
+
+`docker compose ps` reports `healthy` after PostgreSQL passes its health check. The database uses the named `postgres_data` Docker volume and therefore persists across container recreation. For convenience, equivalent commands are available through `make db-up`, `make db-status`, `make db-health`, and `make check` once the virtual environment exists.
+
+Copy `.env.example` to `.env` for local overrides. `.env` is ignored by Git; never commit credentials or connection strings for shared environments.
+
+The default host port is `5433` because many local PostgreSQL installations already use `5432`; PostgreSQL remains on `5432` inside the Compose network. Update both `PUMP_RESEARCH_DATABASE_URL` and `compose.yaml` if a different host port is required.
 
 ## Proposed directory layout
 
@@ -68,6 +92,10 @@ Phase 0 is complete: this repository contains project guidance, an architecture 
 ├── src/
 │   └── pump_research/
 │       ├── domain/          # provider-neutral identities and contracts
+│       ├── config.py        # Pydantic settings
+│       ├── logging.py       # structured logging setup
+│       ├── database.py      # async engine and health check only
+│       ├── cli.py           # `database health` command
 │       ├── discovery/       # replaceable token-discovery adapters
 │       ├── market_data/     # provider-specific market-data clients
 │       ├── collection/      # batching, rate budgets, attempt orchestration
