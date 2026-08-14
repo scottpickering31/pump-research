@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
 from functools import lru_cache
 
 from pydantic import Field, SecretStr, field_validator
@@ -44,6 +45,30 @@ class Settings(BaseSettings):
     scheduler_batch_size: int = Field(default=30, ge=1, le=30)
     scheduler_lease_seconds: int = Field(default=120, ge=1)
     scheduler_max_in_flight_batches: int = Field(default=4, ge=1, le=100)
+    lifecycle_new_to_active_min_volume_m5_usd: Decimal = Field(
+        default=Decimal("100"), ge=0
+    )
+    lifecycle_new_to_watch_min_liquidity_usd: Decimal = Field(
+        default=Decimal("1000"), ge=0
+    )
+    lifecycle_active_to_fading_max_volume_m5_usd: Decimal = Field(
+        default=Decimal("25"), ge=0
+    )
+    lifecycle_watch_to_fading_max_volume_m5_usd: Decimal = Field(
+        default=Decimal("10"), ge=0
+    )
+    lifecycle_fading_to_dormant_max_volume_h1_usd: Decimal = Field(
+        default=Decimal("10"), ge=0
+    )
+    lifecycle_fading_to_dormant_max_liquidity_usd: Decimal = Field(
+        default=Decimal("100"), ge=0
+    )
+    lifecycle_dormant_to_resurrected_min_volume_m5_usd: Decimal = Field(
+        default=Decimal("100"), ge=0
+    )
+    lifecycle_dormant_to_resurrected_min_liquidity_usd: Decimal = Field(
+        default=Decimal("500"), ge=0
+    )
 
     @field_validator("database_url")
     @classmethod

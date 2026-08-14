@@ -1,6 +1,6 @@
 # Database design
 
-The schema is designed for source provenance and high-volume append-only observations. It contains small mutable projections for initial DEX admission and recurring adaptive polls; discovery adapters, market-data clients, and lifecycle classification remain outside the schema.
+The schema is designed for source provenance and high-volume append-only observations. It contains small mutable projections for initial DEX admission and recurring adaptive polls; discovery adapters and market-data clients remain outside the schema. Lifecycle classification writes immutable evidence plus the separate schedule projection.
 
 ## Design principles
 
@@ -48,7 +48,7 @@ The primary key is `(received_at, id)` because PostgreSQL requires the partition
 
 ### `lifecycle_events`
 
-Immutable derived state transitions, isolated from source facts. It stores prior/new state, decision time, input watermark, reason, full configuration snapshot and digest, and optional structured reason detail. `idempotency_key` is globally unique. `ix_lifecycle_events_token_decided_at` supports reconstructing state history as known at a decision time.
+Immutable derived state transitions, isolated from source facts. It stores prior/new state, decision time, input watermark, rule reason, full configuration snapshot and digest, and structured reason detail. The lifecycle classifier records the exact normalized observation values, responsible thresholds, and observation/request identifiers in `reason_detail`; source facts remain in `observations` and `api_request_log`. `idempotency_key` is globally unique. `ix_lifecycle_events_token_decided_at` supports reconstructing state history as known at a decision time.
 
 ### `poll_schedules`
 
