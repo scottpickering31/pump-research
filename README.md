@@ -54,7 +54,9 @@ Each phase requires approval. Cadence and retention decisions remain provisional
 
 ## Current status
 
-Phase 2 is complete. The repository provides the Python development foundation plus PostgreSQL models, an applied Alembic migration, repository abstractions, integration tests, and database design documentation. It intentionally contains no API integrations, discovery implementation, lifecycle heuristics, polling scheduler, or collector.
+Phase 2 persistence is complete, and the DEX Screener market-data client has been implemented ahead of discovery. It provides the Python/PostgreSQL foundation, migrations, repository abstractions, an official-contract async DEX Screener batch client, and tests. Discovery implementation, lifecycle heuristics, polling scheduler, and collector orchestration remain intentionally absent.
+
+The DEX Screener client follows the current official [`/tokens/v1` API reference](https://docs.dexscreener.com/api/reference): 30-address batches, a 300-RPM documented endpoint limit, and a 240-RPM default client budget. See [docs/dexscreener.md](docs/dexscreener.md).
 
 ## Local development setup
 
@@ -90,7 +92,8 @@ The default host port is `5433` because many local PostgreSQL installations alre
 ├── .gitignore
 ├── docs/
 │   ├── architecture.md      # durability and research-integrity design
-│   └── database.md          # persistence schema, indexes, and scale notes
+│   ├── database.md          # persistence schema, indexes, and scale notes
+│   └── dexscreener.md       # official API contract and client policy
 ├── src/
 │   └── pump_research/
 │       ├── domain/          # provider-neutral identities and contracts
@@ -99,8 +102,8 @@ The default host port is `5433` because many local PostgreSQL installations alre
 │       ├── database.py      # async engine and health check only
 │       ├── cli.py           # `database health` command
 │       ├── persistence/     # SQLAlchemy models and repository abstractions
+│       ├── market_data/     # DEX Screener client, parsing, rate limiting
 │       ├── discovery/       # replaceable token-discovery adapters
-│       ├── market_data/     # provider-specific market-data clients
 │       ├── collection/      # batching, rate budgets, attempt orchestration
 │       ├── scheduling/      # durable due-work and lease coordination
 │       ├── lifecycle/       # derived state and versioned transitions

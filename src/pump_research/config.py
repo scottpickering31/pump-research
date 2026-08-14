@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     database_connect_timeout_seconds: float = Field(default=5.0, gt=0)
     log_level: str = "INFO"
     log_json: bool = False
+    dex_screener_base_url: str = "https://api.dexscreener.com"
+    dex_screener_requests_per_minute: int = Field(default=240, gt=0, le=300)
+    dex_screener_timeout_seconds: float = Field(default=10.0, gt=0)
+    dex_screener_max_attempts: int = Field(default=3, ge=1, le=5)
+    dex_screener_retry_backoff_seconds: float = Field(default=0.5, ge=0, le=30)
 
     @field_validator("database_url")
     @classmethod
