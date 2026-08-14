@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -149,6 +150,31 @@ class DiscoveryEvent(Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     source_payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     source_payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    persisted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class DiscoveryCheckpointState(Base):
+    """Mutable provider-neutral projection of the last durable discovery cursor."""
+
+    __tablename__ = "discovery_checkpoint_states"
+    __table_args__ = (
+        CheckConstraint(
+            "coverage_status IN ('complete', 'best_effort', 'unknown')",
+            name="ck_discovery_checkpoint_states_coverage",
+        ),
+    )
+
+    source_name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    checkpoint_value: Mapped[str] = mapped_column(String(2048), nullable=False)
+    last_batch_received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    coverage_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    supports_replay: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    coverage_note: Mapped[str | None] = mapped_column(String(2048))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     persisted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

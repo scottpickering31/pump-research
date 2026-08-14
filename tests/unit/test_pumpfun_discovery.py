@@ -10,6 +10,7 @@ from pump_research.discovery.contracts import (
     DiscoveryCheckpoint,
     DiscoveryCoverageStatus,
     DiscoveryResponseParseError,
+    DiscoverySourceError,
     TokenDiscoverySource,
 )
 from pump_research.discovery.pumpfun import (
@@ -127,3 +128,24 @@ async def test_pumpfun_http_error_is_explicit() -> None:
 
     assert error.value.status_code == 401
     assert error.value.body_preview == "unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_pumpfun_disconnect_is_explicit_and_does_not_advance_checkpoint() -> None:
+    requests = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        raise httpx.ConnectError("simulated discovery disconnect", request=request)
+
+    checkpoint = DiscoveryCheckpoint("durable-before-disconnect")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url=TEST_BASE_URL
+    ) as http:
+        source = PumpFunDiscoverySource(_settings(), http_client=http)
+        with pytest.raises(DiscoverySourceError, match="request failed"):
+            await source.fetch(checkpoint)
+
+    assert requests == 1
+    assert source.metrics.requests_failed == 1

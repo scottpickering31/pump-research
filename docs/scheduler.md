@@ -43,7 +43,7 @@ background or unbounded in-memory queue; `scheduler_max_in_flight_batches`
 bounds outstanding leased batches.
 
 Selection is earliest-due-first. Lifecycle priority breaks equal due times in
-this order: `RESURRECTED`, `NEW`, `ACTIVE`, `WATCH`, `FADING`, `DORMANT`.
+this order: `NEW`, `RESURRECTED`, `ACTIVE`, `WATCH`, `FADING`, `DORMANT`.
 Keeping due time as the primary key means sufficiently overdue dormant work
 cannot be starved by a continuous stream of newly due high-priority work.
 
@@ -64,3 +64,23 @@ batch outcome's completion time to its immutable memberships.
 `poll_batch_members` is monthly partitioned because it grows once per token per
 poll and may reach observation-scale volume. Missing future partitions fail
 loudly and must be provisioned before the current horizon ends.
+
+## Network-free load simulation
+
+The integration suite bulk-loads 3,007 auditable token schedules and runs two
+saturated rolling-minute windows using PostgreSQL and a fake clock. It never
+constructs or invokes the DEX Screener client. The scenario reserves three
+possible attempts per 30-address batch against a configured 240-request ceiling.
+
+The deterministic reference result is 160 batches at 100% mean occupancy,
+240 maximum reserved requests per rolling minute, 607 observations still
+overdue, and claim-lateness p50/p95/p99 of 0/60,000/60,000 ms. The overdue count
+is intentional evidence that this token population and cadence can exceed
+available request capacity; it must remain visible to operations and later
+data-quality reporting.
+
+Separate adversarial tests race concurrent claimers, verify that completed
+batches do not release their rolling-window reservation early, and exercise the
+exact 60-second boundary. The HTTP limiter is also driven through two simulated
+minutes of saturated demand to prove that request starts remain within its
+configured rolling ceiling without issuing network traffic.

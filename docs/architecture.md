@@ -106,6 +106,6 @@ cadences are now implemented. The discovery adapter does not establish
 complete coverage: it has no replayable cursor and its limitation must appear
 in later data-quality reporting. Lifecycle-classification thresholds, archive
 retention, a production-grade cursorable/replayable discovery source, and full
-collector-loop recovery policies remain deferred until verified provider
+collection-worker loop policies remain deferred until verified provider
 contracts, measured volume, storage budget, and operational recovery objectives
 are available.

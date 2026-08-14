@@ -26,8 +26,8 @@ class LifecycleState(StrEnum):
 
 _PRIORITIES: Mapping[LifecycleState, int] = MappingProxyType(
     {
-        LifecycleState.RESURRECTED: 0,
-        LifecycleState.NEW: 1,
+        LifecycleState.NEW: 0,
+        LifecycleState.RESURRECTED: 1,
         LifecycleState.ACTIVE: 2,
         LifecycleState.WATCH: 3,
         LifecycleState.FADING: 4,

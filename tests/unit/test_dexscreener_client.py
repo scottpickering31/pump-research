@@ -137,6 +137,69 @@ async def test_throttled_request_retries_through_the_client() -> None:
 
 
 @pytest.mark.asyncio
+async def test_http_timeout_retries_then_surfaces_failure() -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadTimeout("simulated timeout", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url=TEST_BASE_URL
+    ) as http:
+        metrics = DexScreenerMetrics()
+        client = DexScreenerClient(
+            _settings(max_attempts=2),
+            http_client=http,
+            rate_limiter=_fast_limiter(),
+            metrics=metrics,
+        )
+        with pytest.raises(httpx.ReadTimeout, match="simulated timeout"):
+            await client.fetch_token_pairs(
+                chain_id="solana",
+                token_addresses=["timeout-token"],
+            )
+
+    assert attempts == 2
+    assert metrics.retries == 1
+    assert metrics.http_requests_failed == 2
+
+
+@pytest.mark.asyncio
+async def test_server_error_retries_through_rate_limiter() -> None:
+    attempts = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(500, text="temporary server failure")
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url=TEST_BASE_URL
+    ) as http:
+        metrics = DexScreenerMetrics()
+        client = DexScreenerClient(
+            _settings(max_attempts=2),
+            http_client=http,
+            rate_limiter=_fast_limiter(),
+            metrics=metrics,
+        )
+        result = await client.fetch_token_pairs(
+            chain_id="solana",
+            token_addresses=["server-error-token"],
+        )
+
+    assert result.pairs == ()
+    assert attempts == 2
+    assert metrics.retries == 1
+    assert metrics.http_requests_failed == 1
+    assert metrics.http_requests_succeeded == 1
+
+
+@pytest.mark.asyncio
 async def test_invalid_response_is_explicit_parse_error() -> None:
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"pairs": []})
@@ -155,3 +218,37 @@ async def test_invalid_response_is_explicit_parse_error() -> None:
             await client.fetch_token_pairs(chain_id="solana", token_addresses=["token-0"])
 
     assert metrics.parse_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_is_explicit_parse_error_without_retry() -> None:
+    requests = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            content=b"{not valid json",
+            headers={"Content-Type": "application/json"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url=TEST_BASE_URL
+    ) as http:
+        metrics = DexScreenerMetrics()
+        client = DexScreenerClient(
+            _settings(),
+            http_client=http,
+            rate_limiter=_fast_limiter(),
+            metrics=metrics,
+        )
+        with pytest.raises(DexScreenerResponseParseError, match="parse"):
+            await client.fetch_token_pairs(
+                chain_id="solana",
+                token_addresses=["bad-json-token"],
+            )
+
+    assert requests == 1
+    assert metrics.parse_failures == 1
+    assert metrics.retries == 0

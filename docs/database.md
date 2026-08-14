@@ -9,6 +9,7 @@ The schema is designed for source provenance and high-volume append-only observa
 - `api_request_log`, `discovery_events`, `observations`, `lifecycle_events`, scheduler decisions, poll batches, memberships, and outcomes are immutable at the database level. PostgreSQL triggers reject row updates and deletes.
 - `collector_runs` is intentionally mutable only to record the eventual end/status of a process invocation.
 - `dex_availability_tasks` is an intentionally mutable, leased operational projection. Its append-only lifecycle events remain the state-history record.
+- `discovery_checkpoint_states` is a mutable provider-neutral cursor projection advanced only in the transaction that persists its discovery batch.
 - `poll_schedules` is the recurring-poll projection. Scheduler decisions, batch claims, memberships, and outcomes remain immutable evidence.
 - Source evidence, normalized market facts, and derived lifecycle decisions use separate tables and never overwrite one another.
 
@@ -33,6 +34,10 @@ One immutable external API attempt/result, including request time, receipt time,
 ### `discovery_events`
 
 Immutable source evidence associated with a token. It preserves provider identity, provider event ID when available, source event time, collector receipt time, raw source payload, and payload hash. `idempotency_key` is globally unique, so repeated delivery does not create a duplicate event. Indexes support both token knowledge-time history and provider/source-time coverage analysis.
+
+### `discovery_checkpoint_states`
+
+One current opaque checkpoint per discovery source. It stores the source namespace, opaque cursor or validator, last durable batch receipt time, and coverage semantics. The coordinator advances it only after every event in the batch has been admitted in the same transaction. A disconnect leaves the prior value intact, and a restarted process supplies that exact value back to the replaceable source adapter.
 
 ### `dex_availability_tasks`
 

@@ -10,10 +10,11 @@ cursor formats are opaque outside this package.
 
 ## Checkpoints and durable hand-off
 
-`DiscoveryCheckpoint` is source-owned opaque text. A future checkpoint store
-will associate it with the contract's `source_name`, persist discovered events
-and the new checkpoint in one transaction, and only then advance the source.
-This adapter does not persist anything or advance a cursor itself.
+`DiscoveryCheckpoint` is source-owned opaque text. The provider-neutral
+`discovery_checkpoint_states` projection associates it with the contract's
+`source_name`. `DiscoveryCoordinator` persists discovered events and the new
+checkpoint in one transaction and only then advances the source. The adapter
+itself still does not persist or interpret a cursor.
 
 The returned `received_at` is collector receipt time. `source_event_at` is
 only set when the source supplies a valid timestamp. The full source JSON is
@@ -41,6 +42,6 @@ cursorable or replayable contract (or independently document and report its
 gaps) before the research dataset can claim complete Pump.fun coverage.
 
 The adapter raises explicit transport, HTTP, and parse errors. It keeps small
-in-process request metrics only; durable request attempts, checkpoint commits,
-gap reporting, retries, and scheduling are intentionally deferred to their
-approved phases.
+in-process request metrics only; checkpoint commits are coordinated outside the
+adapter. Durable discovery request attempts, gap reporting, retries, and
+scheduling remain deferred.

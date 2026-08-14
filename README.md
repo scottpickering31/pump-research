@@ -54,7 +54,7 @@ Each phase requires approval. The implemented cadences and lifecycle-classificat
 
 ## Current status
 
-Phase 2 persistence is complete. The DEX Screener market-data client and provider-neutral discovery boundary are implemented. Initial DEX admission retains `PENDING_DEX` tokens through empty results and promotes them to `NEW` only after a matching DEX pair. The durable adaptive scheduler batches and prioritizes recurring polls for `NEW`, `ACTIVE`, `WATCH`, `FADING`, `DORMANT`, and `RESURRECTED` tokens. The lifecycle classifier now applies six configured transitions from immutable observations and preserves every rule input, threshold, configuration snapshot, and state change. Collector-loop orchestration and durable discovery-checkpoint hand-off remain intentionally absent.
+Phase 2 persistence is complete. The DEX Screener market-data client and provider-neutral discovery boundary are implemented. Initial DEX admission retains `PENDING_DEX` tokens through empty results and promotes them to `NEW` only after a matching DEX pair. The durable adaptive scheduler batches and prioritizes recurring polls for `NEW`, `ACTIVE`, `WATCH`, `FADING`, `DORMANT`, and `RESURRECTED` tokens. The lifecycle classifier applies six configured transitions from immutable observations. Discovery batches advance an opaque provider checkpoint atomically with their durable events. A signal-aware collector control process reconstructs PostgreSQL state, finalizes abandoned runs after hard termination, and handles SIGTERM; continuous collection-worker orchestration remains intentionally absent.
 
 The DEX Screener client follows the current official [`/tokens/v1` API reference](https://docs.dexscreener.com/api/reference): 30-address batches, a 300-RPM documented endpoint limit, and a 240-RPM default client budget. See [docs/dexscreener.md](docs/dexscreener.md).
 
@@ -65,6 +65,8 @@ See [docs/dex_availability.md](docs/dex_availability.md) for the initial `PENDIN
 See [docs/scheduler.md](docs/scheduler.md) for adaptive intervals, priority/fairness, leases, batching, request-capacity reservation, restart behavior, and lateness measurements.
 
 See [docs/lifecycle.md](docs/lifecycle.md) for configured lifecycle transitions, their evidence, temporal safeguards, and the intentionally limited current scope.
+
+See [docs/reliability.md](docs/reliability.md) for fault-injection coverage and the physical collector stop/restart test.
 
 ## Local development setup
 
@@ -105,6 +107,7 @@ The default host port is `5433` because many local PostgreSQL installations alre
 │   ├── dex_availability.md  # durable initial DEX-admission workflow
 │   ├── discovery.md         # discovery contract and coverage semantics
 │   ├── lifecycle.md         # configured transition evidence and safeguards
+│   ├── reliability.md       # fault injection and physical restart coverage
 │   └── scheduler.md         # adaptive cadence, priority, and recovery
 ├── src/
 │   └── pump_research/

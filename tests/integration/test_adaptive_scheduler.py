@@ -169,7 +169,7 @@ async def test_equal_due_times_use_lifecycle_priority(
     clock = FakeClock()
     scheduler = AdaptiveScheduler(
         session_factory,
-        _settings(scheduler_batch_size=2),
+        _settings(scheduler_batch_size=6),
         clock=clock,
     )
     specifications = [
@@ -187,8 +187,12 @@ async def test_equal_due_times_use_lifecycle_priority(
 
     assert batch is not None
     assert [member.lifecycle_state for member in batch.members] == [
-        LifecycleState.RESURRECTED,
         LifecycleState.NEW,
+        LifecycleState.RESURRECTED,
+        LifecycleState.ACTIVE,
+        LifecycleState.WATCH,
+        LifecycleState.FADING,
+        LifecycleState.DORMANT,
     ]
 
 

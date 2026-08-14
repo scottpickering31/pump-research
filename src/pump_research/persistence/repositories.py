@@ -15,6 +15,7 @@ from pump_research.persistence.models import (
     ApiRequestLog,
     CollectorRun,
     DexAvailabilityTask,
+    DiscoveryCheckpointState,
     DiscoveryEvent,
     LifecycleEvent,
     Observation,
@@ -238,6 +239,68 @@ class DiscoveryEventRepository:
             select(DiscoveryEvent).where(DiscoveryEvent.idempotency_key == key)
         )
         return result.scalar_one()
+
+
+class DiscoveryCheckpointRepository:
+    """Load and advance a source-owned cursor only after its batch is durable."""
+
+    async def get(
+        self,
+        session: AsyncSession,
+        *,
+        source_name: str,
+    ) -> DiscoveryCheckpointState | None:
+        return await session.get(DiscoveryCheckpointState, source_name)
+
+    async def advance(
+        self,
+        session: AsyncSession,
+        *,
+        source_name: str,
+        checkpoint_value: str,
+        batch_received_at: datetime,
+        coverage_status: str,
+        supports_replay: bool,
+        coverage_note: str | None,
+    ) -> DiscoveryCheckpointState:
+        normalized_received_at = _normalize_utc(batch_received_at, "batch_received_at")
+        assert normalized_received_at is not None
+        statement = (
+            insert(DiscoveryCheckpointState)
+            .values(
+                source_name=source_name,
+                checkpoint_value=checkpoint_value,
+                last_batch_received_at=normalized_received_at,
+                coverage_status=coverage_status,
+                supports_replay=supports_replay,
+                coverage_note=coverage_note,
+                updated_at=normalized_received_at,
+            )
+            .on_conflict_do_update(
+                index_elements=[DiscoveryCheckpointState.source_name],
+                set_={
+                    "checkpoint_value": checkpoint_value,
+                    "last_batch_received_at": normalized_received_at,
+                    "coverage_status": coverage_status,
+                    "supports_replay": supports_replay,
+                    "coverage_note": coverage_note,
+                    "updated_at": normalized_received_at,
+                },
+                where=(
+                    DiscoveryCheckpointState.last_batch_received_at
+                    <= normalized_received_at
+                ),
+            )
+            .returning(DiscoveryCheckpointState.source_name)
+        )
+        advanced_source = (await session.execute(statement)).scalar_one_or_none()
+        state = await session.get(DiscoveryCheckpointState, source_name)
+        if state is None:
+            msg = "Discovery checkpoint was not found after advancement"
+            raise RuntimeError(msg)
+        if advanced_source is None and state.last_batch_received_at > normalized_received_at:
+            return state
+        return state
 
 
 class DexAvailabilityTaskRepository:

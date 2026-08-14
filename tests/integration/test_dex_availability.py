@@ -165,6 +165,42 @@ async def test_due_pending_tokens_are_checked_in_one_dex_batch(
 
 
 @pytest.mark.integration
+async def test_duplicate_discovery_is_idempotent_without_losing_source_evidence(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    address = "duplicate-discovery-token"
+    workflow = DexAvailabilityWorkflow(
+        session_factory,
+        FakeDexSource(present_addresses=set(), received_at=NOW),
+        _settings(),
+    )
+    event = _discovery_event(address)
+
+    first = await workflow.admit_discovery(event)
+    duplicate = await workflow.admit_discovery(event)
+
+    assert duplicate.token_id == first.token_id
+    assert first.pending_task_created is True
+    assert duplicate.pending_task_created is False
+    async with session_factory() as session:
+        token_count = await session.scalar(select(func.count()).select_from(Token))
+        discovery_count = await session.scalar(
+            select(func.count()).select_from(DiscoveryEvent)
+        )
+        lifecycle_count = await session.scalar(
+            select(func.count()).select_from(LifecycleEvent)
+        )
+        task_count = await session.scalar(
+            select(func.count()).select_from(DexAvailabilityTask)
+        )
+
+    assert token_count == 1
+    assert discovery_count == 1
+    assert lifecycle_count == 1
+    assert task_count == 1
+
+
+@pytest.mark.integration
 async def test_restart_recovers_a_leased_pending_token_and_promotes_when_present(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

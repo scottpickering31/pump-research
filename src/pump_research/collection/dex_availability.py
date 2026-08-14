@@ -110,41 +110,49 @@ class DexAvailabilityWorkflow:
     async def admit_discovery(self, event: DiscoveredToken) -> DiscoveryAdmission:
         """Durably persist a discovery event and create its initial pending task."""
         async with self._session_factory() as session, session.begin():
-            token = await self._token_repository.get_or_create(
-                session,
-                chain=event.chain,
-                address=event.address,
-                first_discovered_at=event.source_event_at,
-            )
-            await self._discovery_repository.record(
+            return await self.admit_discovery_in_session(session, event)
+
+    async def admit_discovery_in_session(
+        self,
+        session: AsyncSession,
+        event: DiscoveredToken,
+    ) -> DiscoveryAdmission:
+        """Admit an event inside a batch/checkpoint transaction."""
+        token = await self._token_repository.get_or_create(
+            session,
+            chain=event.chain,
+            address=event.address,
+            first_discovered_at=event.source_event_at,
+        )
+        await self._discovery_repository.record(
+            session,
+            token_id=token.id,
+            idempotency_key=event.idempotency_key,
+            provider=event.source_name,
+            provider_event_id=event.source_event_id,
+            event_type=event.event_type,
+            source_event_at=event.source_event_at,
+            received_at=event.received_at,
+            source_payload=dict(event.source_payload),
+            source_payload_sha256=event.source_payload_sha256,
+        )
+        task, task_created = await self._task_repository.create_pending_if_absent(
+            session,
+            token_id=token.id,
+            due_at=event.received_at,
+        )
+        if task_created:
+            await self._record_lifecycle(
                 session,
                 token_id=token.id,
-                idempotency_key=event.idempotency_key,
-                provider=event.source_name,
-                provider_event_id=event.source_event_id,
-                event_type=event.event_type,
-                source_event_at=event.source_event_at,
-                received_at=event.received_at,
-                source_payload=dict(event.source_payload),
-                source_payload_sha256=event.source_payload_sha256,
+                idempotency_parts=("initial-pending", str(token.id)),
+                previous_state=None,
+                new_state="PENDING_DEX",
+                decided_at=event.received_at,
+                input_watermark=event.received_at,
+                reason_code="discovered_awaiting_dex",
+                reason_detail={"discovery_provider": event.source_name},
             )
-            task, task_created = await self._task_repository.create_pending_if_absent(
-                session,
-                token_id=token.id,
-                due_at=event.received_at,
-            )
-            if task_created:
-                await self._record_lifecycle(
-                    session,
-                    token_id=token.id,
-                    idempotency_parts=("initial-pending", str(token.id)),
-                    previous_state=None,
-                    new_state="PENDING_DEX",
-                    decided_at=event.received_at,
-                    input_watermark=event.received_at,
-                    reason_code="discovered_awaiting_dex",
-                    reason_detail={"discovery_provider": event.source_name},
-                )
         return DiscoveryAdmission(
             token_id=token.id,
             state=task.state,
