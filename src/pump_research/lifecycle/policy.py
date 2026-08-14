@@ -9,7 +9,7 @@ from decimal import Decimal
 from enum import StrEnum
 
 from pump_research.config import Settings
-from pump_research.persistence.models import Observation
+from pump_research.lifecycle.evidence import RawObservationEvidence
 from pump_research.scheduling.policy import LifecycleState
 
 
@@ -82,7 +82,7 @@ class LifecyclePolicy:
         self,
         *,
         state: LifecycleState,
-        observation: Observation,
+        observation: RawObservationEvidence,
     ) -> TransitionEvaluation | None:
         """Evaluate only the permitted outgoing transition from ``state``.
 

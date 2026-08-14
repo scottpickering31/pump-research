@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from pump_research.config import Settings
+from pump_research.lifecycle.evidence import RawObservationEvidence
 from pump_research.lifecycle.policy import LifecyclePolicy, LifecycleTransitionRule
 from pump_research.persistence.models import Observation, Pair, PollSchedule, Token
 from pump_research.persistence.repositories import LifecycleEventRepository, _normalize_utc
@@ -89,9 +90,18 @@ class LifecycleClassifier:
                 return None
 
             current_state = LifecycleState(schedule.lifecycle_state)
+            evidence = RawObservationEvidence(
+                observation_id=observation.id,
+                received_at=observation.received_at,
+                pair_id=observation.pair_id,
+                api_request_log_id=observation.api_request_log_id,
+                volume_m5_usd=observation.volume_m5_usd,
+                volume_h1_usd=observation.volume_h1_usd,
+                liquidity_usd=observation.liquidity_usd,
+            )
             evaluation = self.policy.evaluate(
                 state=current_state,
-                observation=observation,
+                observation=evidence,
             )
             if evaluation is None:
                 return None
@@ -124,10 +134,10 @@ class LifecycleClassifier:
                     "input_values": evaluation.input_values,
                     "thresholds": evaluation.thresholds,
                     "observation": {
-                        "id": str(observation.id),
-                        "received_at": observation.received_at.isoformat(),
-                        "pair_id": str(observation.pair_id),
-                        "api_request_log_id": str(observation.api_request_log_id),
+                        "id": str(evidence.observation_id),
+                        "received_at": evidence.received_at.isoformat(),
+                        "pair_id": str(evidence.pair_id),
+                        "api_request_log_id": str(evidence.api_request_log_id),
                     },
                 },
                 configuration_sha256=self.policy.sha256,

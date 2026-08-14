@@ -55,6 +55,7 @@ async def _create_scheduled_observation(
     clock: FakeClock,
     state: LifecycleState,
     address: str,
+    price_usd: Decimal | None = None,
     volume_m5_usd: Decimal | None = None,
     volume_h1_usd: Decimal | None = None,
     liquidity_usd: Decimal | None = None,
@@ -111,6 +112,7 @@ async def _create_scheduled_observation(
             observations=[
                 ObservationCreate(
                     pair_id=pair.id,
+                    price_usd=price_usd,
                     volume_m5_usd=volume_m5_usd,
                     volume_h1_usd=volume_h1_usd,
                     liquidity_usd=liquidity_usd,
@@ -251,6 +253,76 @@ async def test_supported_transitions_record_complete_reconstructable_evidence(
     assert event.configuration_sha256 == classifier.policy.sha256
     assert event.configuration_snapshot == classifier.policy.snapshot
     assert token_count == 1
+
+
+@pytest.mark.integration
+async def test_lifecycle_derivation_never_mutates_or_stores_state_on_raw_observation(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Raw facts and derived state remain separate before and after classification."""
+    clock = FakeClock()
+    settings = _settings()
+    scheduler = AdaptiveScheduler(session_factory, settings, clock=clock)
+    clock.advance()
+    token, observation = await _create_scheduled_observation(
+        session_factory,
+        scheduler=scheduler,
+        clock=clock,
+        state=LifecycleState.NEW,
+        address="raw-derived-separation",
+        price_usd=Decimal("0.000012345678901234"),
+        volume_m5_usd=Decimal("100"),
+        volume_h1_usd=Decimal("250"),
+        liquidity_usd=Decimal("5000"),
+    )
+    raw_snapshot = (
+        observation.id,
+        observation.received_at,
+        observation.pair_id,
+        observation.api_request_log_id,
+        observation.price_usd,
+        observation.volume_m5_usd,
+        observation.volume_h1_usd,
+        observation.liquidity_usd,
+    )
+    classifier = LifecycleClassifier(session_factory, settings, clock=clock)
+
+    transition = await classifier.evaluate_observation(
+        observation_id=observation.id,
+        received_at=observation.received_at,
+    )
+
+    assert transition is not None
+    assert {"lifecycle_state", "trading_score", "opportunity_score"}.isdisjoint(
+        Observation.__table__.columns.keys()
+    )
+    async with session_factory() as session:
+        reloaded = (
+            await session.execute(
+                select(Observation).where(
+                    Observation.id == observation.id,
+                    Observation.received_at == observation.received_at,
+                )
+            )
+        ).scalar_one()
+        event = await session.get(LifecycleEvent, transition.event_id)
+        schedule = await session.get(PollSchedule, token.id)
+
+    assert (
+        reloaded.id,
+        reloaded.received_at,
+        reloaded.pair_id,
+        reloaded.api_request_log_id,
+        reloaded.price_usd,
+        reloaded.volume_m5_usd,
+        reloaded.volume_h1_usd,
+        reloaded.liquidity_usd,
+    ) == raw_snapshot
+    assert event is not None
+    assert event.previous_state == LifecycleState.NEW.value
+    assert event.new_state == LifecycleState.ACTIVE.value
+    assert schedule is not None
+    assert schedule.lifecycle_state == LifecycleState.ACTIVE.value
 
 
 @pytest.mark.integration

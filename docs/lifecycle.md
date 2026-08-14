@@ -1,11 +1,17 @@
 # Lifecycle classification
 
 Lifecycle classification is derived application state, not a property of a raw
-DEX Screener observation. `LifecycleClassifier` reads one already-persisted
-observation, evaluates the token's current scheduled state, appends a
-`lifecycle_events` row, and updates only the future-poll `poll_schedules`
-projection in the same PostgreSQL transaction. It never deletes a token, pair,
-request record, or observation.
+DEX Screener observation. `LifecycleClassifier` converts the permitted source
+fields into an immutable `RawObservationEvidence` value, evaluates the token's
+current scheduled state, appends a `lifecycle_events` row, and updates only the
+future-poll `poll_schedules` projection in the same PostgreSQL transaction. It
+never deletes or modifies a token, pair, request record, or observation.
+
+`observations` contains source/normalized market facts and intentionally has no
+lifecycle-state, score, recommendation, or trading-decision column.
+`lifecycle_events` is append-only derived history; `poll_schedules` is only its
+mutable current operational projection. No trading or opportunity score exists
+in either boundary.
 
 ## Configured transitions
 
