@@ -20,11 +20,35 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+_MANAGED_PARTITION_PREFIXES = ("observations_", "poll_batch_members_")
+
+
+def include_object(
+    object_: Any,
+    name: str | None,
+    type_: str,
+    reflected: bool,
+    compare_to: Any,
+) -> bool:
+    """Ignore migration-managed child partitions during autogenerate comparison."""
+    if not reflected or compare_to is not None:
+        return True
+    if type_ == "table" and name is not None:
+        return not name.startswith(_MANAGED_PARTITION_PREFIXES)
+    if type_ == "index":
+        table_name = getattr(getattr(object_, "table", None), "name", "")
+        return not table_name.startswith(_MANAGED_PARTITION_PREFIXES)
+    return True
 
 
 def do_run_migrations(connection: Connection) -> None:
     """Run migrations within a synchronous connection bridge."""
-    context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_type=True,
+        include_object=include_object,
+    )
     with context.begin_transaction():
         context.run_migrations()
 

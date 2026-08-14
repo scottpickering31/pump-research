@@ -50,17 +50,19 @@ Dependencies and infrastructure will be introduced only in approved phases.
 6. Operational metrics, collection-gap detection, capacity validation, and 24-hour data-quality reports.
 7. Verified Parquet archival with manifests, integrity checks, and cross-tier reporting.
 
-Each phase requires approval. Cadence and retention decisions remain provisional until measured API and storage budgets exist.
+Each phase requires approval. The implemented cadences are configurable and versioned; lifecycle-classification thresholds and archive retention remain provisional until measured API and storage budgets exist.
 
 ## Current status
 
-Phase 2 persistence is complete. The DEX Screener market-data client and Phase 3 discovery boundary are implemented. Discovery consumers receive provider-neutral canonical token events; the initial Pump.fun latest-coin adapter is explicitly best-effort, rather than claiming complete coverage. Initial durable DEX admission now retains `PENDING_DEX` tokens through empty results and promotes them to `NEW` only after a matching DEX pair. General polling, lifecycle heuristics, and durable discovery-checkpoint hand-off remain intentionally absent.
+Phase 2 persistence is complete. The DEX Screener market-data client and provider-neutral discovery boundary are implemented. Initial DEX admission retains `PENDING_DEX` tokens through empty results and promotes them to `NEW` only after a matching DEX pair. The durable adaptive scheduler now batches and prioritizes recurring polls for `NEW`, `ACTIVE`, `WATCH`, `FADING`, `DORMANT`, and `RESURRECTED` tokens. Lifecycle classification heuristics, collector-loop orchestration, and durable discovery-checkpoint hand-off remain intentionally absent.
 
 The DEX Screener client follows the current official [`/tokens/v1` API reference](https://docs.dexscreener.com/api/reference): 30-address batches, a 300-RPM documented endpoint limit, and a 240-RPM default client budget. See [docs/dexscreener.md](docs/dexscreener.md).
 
 See [docs/discovery.md](docs/discovery.md) for the provider-neutral discovery contract and the important coverage limitation of the initial Pump.fun adapter.
 
 See [docs/dex_availability.md](docs/dex_availability.md) for the initial `PENDING_DEX → NEW` workflow, batch limit, and restart recovery behavior.
+
+See [docs/scheduler.md](docs/scheduler.md) for adaptive intervals, priority/fairness, leases, batching, request-capacity reservation, restart behavior, and lateness measurements.
 
 ## Local development setup
 
@@ -99,7 +101,8 @@ The default host port is `5433` because many local PostgreSQL installations alre
 │   ├── database.md          # persistence schema, indexes, and scale notes
 │   ├── dexscreener.md       # official API contract and client policy
 │   ├── dex_availability.md  # durable initial DEX-admission workflow
-│   └── discovery.md         # discovery contract and coverage semantics
+│   ├── discovery.md         # discovery contract and coverage semantics
+│   └── scheduler.md         # adaptive cadence, priority, and recovery
 ├── src/
 │   └── pump_research/
 │       ├── domain/          # provider-neutral identities and contracts
@@ -111,7 +114,7 @@ The default host port is `5433` because many local PostgreSQL installations alre
 │       ├── market_data/     # DEX Screener client, parsing, rate limiting
 │       ├── discovery/       # provider-neutral contract and replaceable adapters
 │       ├── collection/      # initial DEX admission and later orchestration
-│       ├── scheduling/      # durable due-work and lease coordination
+│       ├── scheduling/      # durable adaptive due-work and lease coordination
 │       ├── lifecycle/       # derived state and versioned transitions
 │       ├── archival/        # verified Parquet archival and manifests
 │       ├── reporting/       # as-of data-quality/collection reports

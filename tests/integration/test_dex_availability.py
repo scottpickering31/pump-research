@@ -20,6 +20,7 @@ from pump_research.persistence.models import (
     DexAvailabilityTask,
     DiscoveryEvent,
     LifecycleEvent,
+    PollSchedule,
     Token,
 )
 from pump_research.persistence.repositories import DexAvailabilityTaskRepository
@@ -158,7 +159,9 @@ async def test_due_pending_tokens_are_checked_in_one_dex_batch(
     assert result.claimed_tokens == 2
     assert result.checked_tokens == 2
     assert result.retained_pending_tokens == 2
-    assert dex.calls == [("solana", addresses)]
+    assert len(dex.calls) == 1
+    assert dex.calls[0][0] == "solana"
+    assert set(dex.calls[0][1]) == set(addresses)
 
 
 @pytest.mark.integration
@@ -196,6 +199,7 @@ async def test_restart_recovers_a_leased_pending_token_and_promotes_when_present
 
     async with session_factory() as session:
         task = await session.get(DexAvailabilityTask, admission.token_id)
+        poll_schedule = await session.get(PollSchedule, admission.token_id)
         states = list(
             (
                 await session.execute(
@@ -208,4 +212,7 @@ async def test_restart_recovers_a_leased_pending_token_and_promotes_when_present
     assert task.state == "NEW"
     assert task.attempt_count == 1
     assert task.lease_id is None
+    assert poll_schedule is not None
+    assert poll_schedule.lifecycle_state == "NEW"
+    assert poll_schedule.next_due_at == NOW + timedelta(seconds=16)
     assert states == ["PENDING_DEX", "NEW"]

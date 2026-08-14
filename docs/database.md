@@ -1,14 +1,15 @@
 # Database design
 
-The initial schema is designed for source provenance and high-volume append-only observations. It now also contains a small mutable projection for the approved initial DEX-availability admission workflow; discovery adapters, market-data clients, and general polling policy remain outside the schema.
+The schema is designed for source provenance and high-volume append-only observations. It contains small mutable projections for initial DEX admission and recurring adaptive polls; discovery adapters, market-data clients, and lifecycle classification remain outside the schema.
 
 ## Design principles
 
 - All timestamps are `timestamptz`. Repository writes reject naïve datetimes and normalize aware input to UTC; async database sessions also set PostgreSQL's timezone to UTC.
 - Tokens and pairs are stable identities; static identity attributes are not repeated in observations.
-- `api_request_log`, `discovery_events`, `observations`, and `lifecycle_events` are immutable at the database level. PostgreSQL triggers reject row updates and deletes.
+- `api_request_log`, `discovery_events`, `observations`, `lifecycle_events`, scheduler decisions, poll batches, memberships, and outcomes are immutable at the database level. PostgreSQL triggers reject row updates and deletes.
 - `collector_runs` is intentionally mutable only to record the eventual end/status of a process invocation.
 - `dex_availability_tasks` is an intentionally mutable, leased operational projection. Its append-only lifecycle events remain the state-history record.
+- `poll_schedules` is the recurring-poll projection. Scheduler decisions, batch claims, memberships, and outcomes remain immutable evidence.
 - Source evidence, normalized market facts, and derived lifecycle decisions use separate tables and never overwrite one another.
 
 ## Tables
@@ -49,6 +50,26 @@ The primary key is `(received_at, id)` because PostgreSQL requires the partition
 
 Immutable derived state transitions, isolated from source facts. It stores prior/new state, decision time, input watermark, reason, full configuration snapshot and digest, and optional structured reason detail. `idempotency_key` is globally unique. `ix_lifecycle_events_token_decided_at` supports reconstructing state history as known at a decision time.
 
+### `poll_schedules`
+
+One mutable current projection per recurring token. It contains lifecycle state, priority, next due time, latest due/start/completion times, attempt count, policy version, and an expiring batch lease. `ix_poll_schedules_due_priority` supports earliest-due-first selection. Lifecycle priority is a tie-breaker so lower-frequency states cannot starve behind continuously arriving high-priority work.
+
+### `poll_schedule_decisions`
+
+Immutable evidence of initial scheduling, lifecycle-driven cadence changes, and configuration changes. It preserves previous/new state, previous/new due time, reason, decision time, and the complete policy snapshot/digest. Same-state delivery under an unchanged policy is idempotent and does not postpone an existing obligation.
+
+### `poll_batches`
+
+Immutable evidence that a worker claimed one single-chain batch. It records claim and lease-expiry times plus conservative API-request capacity reserved for the batch's possible retries. The provider/time index supports the shared rolling request-budget calculation and request-rate audits.
+
+### `poll_batch_members`
+
+Immutable per-token membership for each claimed batch: original due time, claim time, lifecycle state, priority, claim lateness, and any expired predecessor batch. This makes late, retried, and abandoned obligations measurable after restart. The table is monthly partitioned on `claimed_at` because it grows at approximately one row per scheduled token poll.
+
+### `poll_batch_outcomes`
+
+At most one immutable completion per batch. It records outcome, completion time, optional API-request provenance, member count, failure detail, completion policy, and min/max/mean observation lateness. A claimed batch without an outcome is explicit evidence of interrupted work rather than a silent gap.
+
 ## Expected query patterns
 
 - Find a token by `(chain, address)`; then load its pairs via `ix_pairs_token_id`.
@@ -56,12 +77,14 @@ Immutable derived state transitions, isolated from source facts. It stores prior
 - Join an observation to `api_request_log` to recover request/receipt timing and the original batch payload/response.
 - Reconstruct discovery knowledge by token/receipt time, or source coverage by provider/source event time.
 - Claim the earliest due `PENDING_DEX` tasks with `FOR UPDATE SKIP LOCKED`, while allowing expired leases to be recovered.
+- Claim one chain-specific recurring poll batch, audit its members and request reservation, and reject stale completion after lease recovery.
+- Measure due-to-claim and due-to-completion lateness over bounded receipt-time ranges.
 - Reconstruct lifecycle decisions by token/decision time, retaining their exact input watermark and configuration snapshot.
 - Investigate failures or gaps by provider/request time and collector run.
 
 ## Scalability and partitioning
 
-`observations` is the only initial table expected to grow beyond 100M rows. It uses monthly range partitions on `received_at`, which keeps receipt-time queries and retention/archival operations bounded without creating a partition per token. The initial migration creates monthly partitions from January 2026 through December 2027. There is intentionally no default partition: an uncovered month fails loudly instead of silently placing high-volume data into an unbounded catch-all table.
+`observations` and `poll_batch_members` may grow beyond 100M rows. Both use monthly range partitions on their collector timestamps, which keeps time-bounded queries and retention/archival operations bounded without creating a partition per token. Their migrations create monthly partitions from January 2026 through December 2027. There is intentionally no default partition: an uncovered month fails loudly instead of silently placing high-volume data into an unbounded catch-all table.
 
 Before the final provisioned month, an approved operational migration must create additional partitions. Partition interval, index count, and retention timing must be revalidated with actual observations/day, pair multiplicity, row/index size, WAL volume, and query workload. The observation index set is intentionally limited to the pair/time series path plus the partition-compatible idempotency constraint. Bulk inserts should use the repository's multi-row path, not ORM object graphs.
 

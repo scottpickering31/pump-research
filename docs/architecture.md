@@ -100,11 +100,12 @@ Files are published atomically and independently read back before a manifest bec
 
 ## Decisions intentionally deferred
 
-The initial persistence schema, DEX Screener endpoint, and a deliberately
-best-effort Pump.fun latest-coin adapter are now implemented. The adapter does
-not establish complete discovery coverage: it has no replayable cursor and its
-coverage limitation must appear in later data-quality reporting. Partition
-interval, polling thresholds, archive retention, a production-grade
-cursorable/replayable discovery source, and exact collection recovery policies
-remain deferred until verified provider contracts, expected volume, storage
-budget, and operational recovery objectives are available.
+The initial persistence schema, DEX Screener endpoint, a deliberately
+best-effort Pump.fun latest-coin adapter, and the configured adaptive polling
+cadences are now implemented. The discovery adapter does not establish
+complete coverage: it has no replayable cursor and its limitation must appear
+in later data-quality reporting. Lifecycle-classification thresholds, archive
+retention, a production-grade cursorable/replayable discovery source, and full
+collector-loop recovery policies remain deferred until verified provider
+contracts, measured volume, storage budget, and operational recovery objectives
+are available.

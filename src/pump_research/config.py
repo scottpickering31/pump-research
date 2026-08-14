@@ -35,6 +35,15 @@ class Settings(BaseSettings):
     pump_fun_timeout_seconds: float = Field(default=10.0, gt=0)
     dex_availability_retry_seconds: int = Field(default=60, ge=1)
     dex_availability_lease_seconds: int = Field(default=120, ge=1)
+    scheduler_new_interval_seconds: int = Field(default=5, ge=1)
+    scheduler_active_interval_seconds: int = Field(default=5, ge=1)
+    scheduler_watch_interval_seconds: int = Field(default=15, ge=1)
+    scheduler_fading_interval_seconds: int = Field(default=60, ge=1)
+    scheduler_dormant_interval_seconds: int = Field(default=900, ge=1)
+    scheduler_resurrected_interval_seconds: int = Field(default=5, ge=1)
+    scheduler_batch_size: int = Field(default=30, ge=1, le=30)
+    scheduler_lease_seconds: int = Field(default=120, ge=1)
+    scheduler_max_in_flight_batches: int = Field(default=4, ge=1, le=100)
 
     @field_validator("database_url")
     @classmethod

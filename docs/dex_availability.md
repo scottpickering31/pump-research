@@ -29,6 +29,10 @@ are stored with every lifecycle decision. A worker crash can leave a lease, but
 another process can reclaim it after expiry from PostgreSQL; no in-memory queue
 is authoritative.
 
+Promotion to `NEW` creates the first recurring adaptive-poll schedule in the
+same transaction, due at the configured `NEW` interval. A crash therefore
+cannot commit `NEW` while silently losing its first market-poll obligation.
+
 An API failure is recorded as a failed/throttled `api_request_log` row, leaves
 the token `PENDING_DEX`, and schedules a retry. The workflow intentionally does
 not create market observations or select a primary pair; those remain later

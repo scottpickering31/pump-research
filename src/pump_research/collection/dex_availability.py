@@ -38,6 +38,8 @@ from pump_research.persistence.repositories import (
     LifecycleEventRepository,
     TokenRepository,
 )
+from pump_research.scheduling.policy import LifecycleState
+from pump_research.scheduling.scheduler import AdaptiveScheduler
 
 _WORKFLOW_NAME = "dex_availability_admission"
 _DEX_ENDPOINT = "/tokens/v1/{chain_id}/{token_addresses}"
@@ -103,6 +105,7 @@ class DexAvailabilityWorkflow:
         self._task_repository = DexAvailabilityTaskRepository()
         self._request_repository = ApiRequestLogRepository()
         self._lifecycle_repository = LifecycleEventRepository()
+        self._adaptive_scheduler = AdaptiveScheduler(session_factory, settings)
 
     async def admit_discovery(self, event: DiscoveredToken) -> DiscoveryAdmission:
         """Durably persist a discovery event and create its initial pending task."""
@@ -289,6 +292,13 @@ class DexAvailabilityWorkflow:
                             "api_request_log_id": str(request.id),
                             "matching_pair_count": len(matched_pairs[claim.token_id]),
                         },
+                    )
+                    await self._adaptive_scheduler.set_lifecycle_state_in_session(
+                        session,
+                        token_id=claim.token_id,
+                        state=LifecycleState.NEW,
+                        decided_at=received_at,
+                        reason_code="dex_pair_present",
                     )
         self._logger.info(
             "dex_availability_batch_completed",

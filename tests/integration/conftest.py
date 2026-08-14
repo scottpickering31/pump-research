@@ -35,8 +35,10 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     async with engine.begin() as connection:
         await connection.execute(
             text(
-                "TRUNCATE dex_availability_tasks, observations, lifecycle_events, "
-                "discovery_events, api_request_log, pairs, tokens, collector_runs CASCADE"
+                "TRUNCATE poll_batch_outcomes, poll_batch_members, poll_schedule_decisions, "
+                "poll_schedules, poll_batches, dex_availability_tasks, observations, "
+                "lifecycle_events, discovery_events, api_request_log, pairs, tokens, "
+                "collector_runs CASCADE"
             )
         )
 

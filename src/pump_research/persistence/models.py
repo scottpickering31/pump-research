@@ -266,3 +266,172 @@ class LifecycleEvent(Base):
     persisted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+_SCHEDULABLE_STATES_SQL = "'NEW', 'ACTIVE', 'WATCH', 'FADING', 'DORMANT', 'RESURRECTED'"
+
+
+class PollBatch(Base):
+    """Immutable evidence that one bounded poll batch was claimed."""
+
+    __tablename__ = "poll_batches"
+    __table_args__ = (
+        CheckConstraint("reserved_request_capacity > 0", name="ck_poll_batches_reservation"),
+        Index("ix_poll_batches_provider_claimed_at", "provider", "claimed_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    chain: Mapped[str] = mapped_column(String(32), nullable=False)
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reserved_request_capacity: Mapped[int] = mapped_column(Integer, nullable=False)
+    configuration_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    configuration_snapshot: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    persisted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PollSchedule(Base):
+    """Mutable current projection for recurring token observation work."""
+
+    __tablename__ = "poll_schedules"
+    __table_args__ = (
+        CheckConstraint(
+            f"lifecycle_state IN ({_SCHEDULABLE_STATES_SQL})",
+            name="ck_poll_schedules_lifecycle_state",
+        ),
+        CheckConstraint("priority >= 0", name="ck_poll_schedules_priority"),
+        CheckConstraint("attempt_count >= 0", name="ck_poll_schedules_attempt_count"),
+        CheckConstraint(
+            "(lease_id IS NULL AND lease_expires_at IS NULL) OR "
+            "(lease_id IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="ck_poll_schedules_lease_pair",
+        ),
+        Index("ix_poll_schedules_due_priority", "next_due_at", "priority"),
+    )
+
+    token_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("tokens.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    state_decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("poll_batches.id", ondelete="RESTRICT"),
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    configuration_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    configuration_snapshot: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    persisted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PollScheduleDecision(Base):
+    """Immutable evidence of initial scheduling or a lifecycle-policy change."""
+
+    __tablename__ = "poll_schedule_decisions"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_poll_schedule_decisions_idempotency_key"),
+        Index("ix_poll_schedule_decisions_token_decided_at", "token_id", "decided_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    token_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("tokens.id", ondelete="RESTRICT"), nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    previous_state: Mapped[str | None] = mapped_column(String(32))
+    new_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    previous_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    new_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(128), nullable=False)
+    configuration_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    configuration_snapshot: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    persisted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PollBatchMember(Base):
+    """Immutable per-token membership and due-time evidence for a claimed batch."""
+
+    __tablename__ = "poll_batch_members"
+    __table_args__ = (
+        PrimaryKeyConstraint("claimed_at", "batch_id", "token_id", name="pk_poll_batch_members"),
+        CheckConstraint("priority >= 0", name="ck_poll_batch_members_priority"),
+        CheckConstraint("claim_lateness_ms >= 0", name="ck_poll_batch_members_lateness"),
+        Index("ix_poll_batch_members_token_due_at", "token_id", "due_at"),
+        {"postgresql_partition_by": "RANGE (claimed_at)"},
+    )
+
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("poll_batches.id", ondelete="RESTRICT"), nullable=False
+    )
+    token_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("tokens.id", ondelete="RESTRICT"), nullable=False
+    )
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False)
+    claim_lateness_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    previous_batch_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("poll_batches.id", ondelete="RESTRICT")
+    )
+    persisted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PollBatchOutcome(Base):
+    """Immutable completion and observation-lateness summary for a poll batch."""
+
+    __tablename__ = "poll_batch_outcomes"
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('succeeded', 'empty', 'partial', 'failed', 'throttled', "
+            "'malformed', 'cancelled')",
+            name="ck_poll_batch_outcomes_outcome",
+        ),
+        CheckConstraint("member_count > 0", name="ck_poll_batch_outcomes_member_count"),
+        CheckConstraint(
+            "observation_lateness_min_ms >= 0 AND observation_lateness_max_ms >= 0 "
+            "AND observation_lateness_mean_ms >= 0",
+            name="ck_poll_batch_outcomes_lateness",
+        ),
+        Index("ix_poll_batch_outcomes_completed_at", "completed_at"),
+    )
+
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("poll_batches.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    api_request_log_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("api_request_log.id", ondelete="RESTRICT")
+    )
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    member_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    observation_lateness_min_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    observation_lateness_max_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    observation_lateness_mean_ms: Mapped[Decimal] = mapped_column(Numeric(20, 3), nullable=False)
+    failure_detail: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+    configuration_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    configuration_snapshot: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
+    persisted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
