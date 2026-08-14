@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     pump_fun_base_url: str = "https://frontend-api-v3.pump.fun"
     pump_fun_api_token: SecretStr | None = None
     pump_fun_timeout_seconds: float = Field(default=10.0, gt=0)
+    dex_availability_retry_seconds: int = Field(default=60, ge=1)
+    dex_availability_lease_seconds: int = Field(default=120, ge=1)
 
     @field_validator("database_url")
     @classmethod

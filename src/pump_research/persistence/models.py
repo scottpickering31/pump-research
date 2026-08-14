@@ -18,6 +18,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -148,6 +149,44 @@ class DiscoveryEvent(Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     source_payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     source_payload_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    persisted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class DexAvailabilityTask(Base):
+    """Mutable operational projection for DEX-availability admission work.
+
+    The append-only lifecycle history remains authoritative for state history;
+    this table only makes due-work lookup and crash recovery efficient.
+    """
+
+    __tablename__ = "dex_availability_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('PENDING_DEX', 'NEW')",
+            name="ck_dex_availability_tasks_state",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_dex_availability_tasks_attempt_count"),
+        Index(
+            "ix_dex_availability_tasks_due_pending",
+            "next_check_at",
+            postgresql_where=text("state = 'PENDING_DEX'"),
+        ),
+    )
+
+    token_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("tokens.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    next_check_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     persisted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

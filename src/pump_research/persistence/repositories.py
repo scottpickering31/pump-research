@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pump_research.persistence.models import (
     ApiRequestLog,
     CollectorRun,
+    DexAvailabilityTask,
     DiscoveryEvent,
     LifecycleEvent,
     Observation,
@@ -24,6 +25,16 @@ from pump_research.persistence.models import (
 
 class PairTokenMismatchError(ValueError):
     """Raised when a canonical pair is associated with another tracked token."""
+
+
+@dataclass(frozen=True, slots=True)
+class DexAvailabilityClaim:
+    """One leased pending token, safe to process until its lease expires."""
+
+    token_id: uuid.UUID
+    chain: str
+    address: str
+    lease_id: uuid.UUID
 
 
 def _normalize_utc(value: datetime | None, field_name: str) -> datetime | None:
@@ -227,6 +238,178 @@ class DiscoveryEventRepository:
             select(DiscoveryEvent).where(DiscoveryEvent.idempotency_key == key)
         )
         return result.scalar_one()
+
+
+class DexAvailabilityTaskRepository:
+    """Durable projection and leases for tokens awaiting first DEX presence."""
+
+    async def create_pending_if_absent(
+        self,
+        session: AsyncSession,
+        *,
+        token_id: uuid.UUID,
+        due_at: datetime,
+    ) -> tuple[DexAvailabilityTask, bool]:
+        normalized_due_at = _normalize_utc(due_at, "due_at")
+        assert normalized_due_at is not None
+        statement = (
+            insert(DexAvailabilityTask)
+            .values(
+                token_id=token_id,
+                state="PENDING_DEX",
+                next_check_at=normalized_due_at,
+                attempt_count=0,
+                updated_at=normalized_due_at,
+            )
+            .on_conflict_do_nothing(index_elements=[DexAvailabilityTask.token_id])
+            .returning(DexAvailabilityTask.token_id)
+        )
+        inserted_token_id = (await session.execute(statement)).scalar_one_or_none()
+        task = await session.get(DexAvailabilityTask, token_id)
+        if task is None:
+            msg = "DEX availability task was not found after creation"
+            raise RuntimeError(msg)
+        return task, inserted_token_id is not None
+
+    async def claim_due(
+        self,
+        session: AsyncSession,
+        *,
+        now: datetime,
+        limit: int,
+        lease_duration: timedelta,
+    ) -> list[DexAvailabilityClaim]:
+        """Lease due tasks; expired leases are deliberately reclaimable after crashes."""
+        normalized_now = _normalize_utc(now, "now")
+        assert normalized_now is not None
+        if limit < 1:
+            msg = "limit must be at least one"
+            raise ValueError(msg)
+        if lease_duration <= timedelta(0):
+            msg = "lease_duration must be positive"
+            raise ValueError(msg)
+
+        result = await session.execute(
+            select(DexAvailabilityTask, Token)
+            .join(Token, Token.id == DexAvailabilityTask.token_id)
+            .where(
+                DexAvailabilityTask.state == "PENDING_DEX",
+                DexAvailabilityTask.next_check_at <= normalized_now,
+                or_(
+                    DexAvailabilityTask.lease_id.is_(None),
+                    DexAvailabilityTask.lease_expires_at <= normalized_now,
+                ),
+            )
+            .order_by(DexAvailabilityTask.next_check_at, DexAvailabilityTask.token_id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        rows = result.all()
+        if not rows:
+            return []
+
+        lease_id = uuid.uuid4()
+        expires_at = normalized_now + lease_duration
+        claims: list[DexAvailabilityClaim] = []
+        for task, token in rows:
+            task.lease_id = lease_id
+            task.lease_expires_at = expires_at
+            task.updated_at = normalized_now
+            claims.append(
+                DexAvailabilityClaim(
+                    token_id=task.token_id,
+                    chain=token.chain,
+                    address=token.address,
+                    lease_id=lease_id,
+                )
+            )
+        await session.flush()
+        return claims
+
+    async def complete_with_retry(
+        self,
+        session: AsyncSession,
+        *,
+        token_ids: list[uuid.UUID],
+        lease_id: uuid.UUID,
+        checked_at: datetime,
+        retry_at: datetime,
+    ) -> list[DexAvailabilityTask]:
+        """Release an owned lease while retaining tokens for a later DEX check."""
+        return await self._complete(
+            session,
+            token_ids=token_ids,
+            lease_id=lease_id,
+            checked_at=checked_at,
+            next_state="PENDING_DEX",
+            next_check_at=retry_at,
+        )
+
+    async def complete_as_new(
+        self,
+        session: AsyncSession,
+        *,
+        token_ids: list[uuid.UUID],
+        lease_id: uuid.UUID,
+        checked_at: datetime,
+    ) -> list[DexAvailabilityTask]:
+        """Release an owned lease and mark a token as DEX-present."""
+        return await self._complete(
+            session,
+            token_ids=token_ids,
+            lease_id=lease_id,
+            checked_at=checked_at,
+            next_state="NEW",
+            next_check_at=checked_at,
+        )
+
+    async def get(self, session: AsyncSession, *, token_id: uuid.UUID) -> DexAvailabilityTask:
+        """Load the current projection for one token."""
+        task = await session.get(DexAvailabilityTask, token_id)
+        if task is None:
+            msg = "DEX availability task was not found"
+            raise LookupError(msg)
+        return task
+
+    async def _complete(
+        self,
+        session: AsyncSession,
+        *,
+        token_ids: list[uuid.UUID],
+        lease_id: uuid.UUID,
+        checked_at: datetime,
+        next_state: str,
+        next_check_at: datetime,
+    ) -> list[DexAvailabilityTask]:
+        normalized_checked_at = _normalize_utc(checked_at, "checked_at")
+        normalized_next_check_at = _normalize_utc(next_check_at, "next_check_at")
+        assert normalized_checked_at is not None
+        assert normalized_next_check_at is not None
+        if not token_ids:
+            return []
+        result = await session.execute(
+            select(DexAvailabilityTask)
+            .where(
+                DexAvailabilityTask.token_id.in_(token_ids),
+                DexAvailabilityTask.lease_id == lease_id,
+                DexAvailabilityTask.state == "PENDING_DEX",
+            )
+            .with_for_update()
+        )
+        tasks = list(result.scalars())
+        if len(tasks) != len(token_ids):
+            msg = "DEX availability lease is no longer owned by this worker"
+            raise RuntimeError(msg)
+        for task in tasks:
+            task.state = next_state
+            task.next_check_at = normalized_next_check_at
+            task.last_checked_at = normalized_checked_at
+            task.attempt_count += 1
+            task.lease_id = None
+            task.lease_expires_at = None
+            task.updated_at = normalized_checked_at
+        await session.flush()
+        return tasks
 
 
 class ApiRequestLogRepository:

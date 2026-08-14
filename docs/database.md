@@ -1,6 +1,6 @@
 # Database design
 
-This Phase 2 schema is designed for source provenance and high-volume append-only observations. It deliberately contains no discovery adapter, DEX Screener client, scheduler, or lifecycle classification logic.
+The initial schema is designed for source provenance and high-volume append-only observations. It now also contains a small mutable projection for the approved initial DEX-availability admission workflow; discovery adapters, market-data clients, and general polling policy remain outside the schema.
 
 ## Design principles
 
@@ -8,6 +8,7 @@ This Phase 2 schema is designed for source provenance and high-volume append-onl
 - Tokens and pairs are stable identities; static identity attributes are not repeated in observations.
 - `api_request_log`, `discovery_events`, `observations`, and `lifecycle_events` are immutable at the database level. PostgreSQL triggers reject row updates and deletes.
 - `collector_runs` is intentionally mutable only to record the eventual end/status of a process invocation.
+- `dex_availability_tasks` is an intentionally mutable, leased operational projection. Its append-only lifecycle events remain the state-history record.
 - Source evidence, normalized market facts, and derived lifecycle decisions use separate tables and never overwrite one another.
 
 ## Tables
@@ -32,6 +33,12 @@ One immutable external API attempt/result, including request time, receipt time,
 
 Immutable source evidence associated with a token. It preserves provider identity, provider event ID when available, source event time, collector receipt time, raw source payload, and payload hash. `idempotency_key` is globally unique, so repeated delivery does not create a duplicate event. Indexes support both token knowledge-time history and provider/source-time coverage analysis.
 
+### `dex_availability_tasks`
+
+One current-work projection per token for initial DEX availability. New discovery creates a `PENDING_DEX` row and an append-only matching lifecycle event in the same transaction. The row records its next check time, latest check, attempt count, and an expiring lease. An empty DEX result keeps the row in `PENDING_DEX` and advances `next_check_at`; a matching pair changes it to `NEW`. Neither operation deletes the token or its source evidence.
+
+The partial index `ix_dex_availability_tasks_due_pending` contains only `PENDING_DEX` rows ordered by `next_check_at`, keeping due-work claims efficient even after many tokens become `NEW`. Leases are intentionally reclaimable after expiry, so a reboot after a claim cannot strand a token. This table does not contain raw DEX facts: request/response evidence remains in `api_request_log` and every state decision is separately append-only in `lifecycle_events`.
+
 ### `observations`
 
 Immutable normalized market measurements for one pair from one API request. It includes source observation time when supplied, a locator into the parent raw response, source-record hash, and typed decimal market values. `received_at` is the collector knowledge-time and partition key; metrics never carry lifecycle state or static token metadata.
@@ -48,6 +55,7 @@ Immutable derived state transitions, isolated from source facts. It stores prior
 - Read a pair's observation series over a bounded receipt-time range via `ix_observations_pair_received_at` and only the relevant monthly partitions.
 - Join an observation to `api_request_log` to recover request/receipt timing and the original batch payload/response.
 - Reconstruct discovery knowledge by token/receipt time, or source coverage by provider/source event time.
+- Claim the earliest due `PENDING_DEX` tasks with `FOR UPDATE SKIP LOCKED`, while allowing expired leases to be recovered.
 - Reconstruct lifecycle decisions by token/decision time, retaining their exact input watermark and configuration snapshot.
 - Investigate failures or gaps by provider/request time and collector run.
 

@@ -30,18 +30,25 @@ def apply_migrations() -> None:
 
 
 @pytest_asyncio.fixture
-async def session() -> AsyncIterator[AsyncSession]:
+async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     engine = create_async_engine(DATABASE_URL)
     async with engine.begin() as connection:
         await connection.execute(
             text(
-                "TRUNCATE observations, lifecycle_events, discovery_events, api_request_log, "
-                "pairs, tokens, collector_runs CASCADE"
+                "TRUNCATE dex_availability_tasks, observations, lifecycle_events, "
+                "discovery_events, api_request_log, pairs, tokens, collector_runs CASCADE"
             )
         )
 
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    yield factory
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def session(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[AsyncSession]:
+    """A convenience session for persistence tests using the clean database fixture."""
     async with session_factory() as database_session:
         yield database_session
-
-    await engine.dispose()
