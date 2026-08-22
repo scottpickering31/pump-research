@@ -165,6 +165,26 @@ async def test_due_pending_tokens_are_checked_in_one_dex_batch(
 
 
 @pytest.mark.integration
+async def test_mixed_availability_batch_is_recorded_as_partial(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    present, absent = "mixed-present", "mixed-absent"
+    dex = FakeDexSource(present_addresses={present}, received_at=NOW + timedelta(seconds=1))
+    workflow = DexAvailabilityWorkflow(session_factory, dex, _settings())
+    await workflow.admit_discovery(_discovery_event(present))
+    await workflow.admit_discovery(_discovery_event(absent))
+
+    result = await workflow.check_due(now=NOW)
+
+    async with session_factory() as session:
+        request = (await session.execute(select(ApiRequestLog))).scalar_one()
+    assert result.promoted_new_tokens == 1
+    assert result.retained_pending_tokens == 1
+    assert request.outcome == "partial"
+    assert request.failure_detail == {"unmatched_addresses": [absent]}
+
+
+@pytest.mark.integration
 async def test_duplicate_discovery_is_idempotent_without_losing_source_evidence(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -250,5 +270,5 @@ async def test_restart_recovers_a_leased_pending_token_and_promotes_when_present
     assert task.lease_id is None
     assert poll_schedule is not None
     assert poll_schedule.lifecycle_state == "NEW"
-    assert poll_schedule.next_due_at == NOW + timedelta(seconds=16)
+    assert poll_schedule.next_due_at == NOW + timedelta(seconds=26)
     assert states == ["PENDING_DEX", "NEW"]

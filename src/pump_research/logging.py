@@ -4,11 +4,31 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Any, cast
+from io import TextIOBase
+from typing import Any, TextIO, cast
 
 import structlog
 
 from pump_research.config import Settings
+
+
+class BrokenPipeSafeWriter(TextIOBase):
+    """Make pipeline closure unable to interrupt collector state finalization."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+
+    def write(self, value: str) -> int:
+        try:
+            return self._stream.write(value)
+        except BrokenPipeError:
+            return len(value)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except BrokenPipeError:
+            return
 
 
 def configure_logging(settings: Settings) -> None:
@@ -32,7 +52,9 @@ def configure_logging(settings: Settings) -> None:
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
-        logger_factory=structlog.PrintLoggerFactory(),
+        logger_factory=structlog.PrintLoggerFactory(
+            file=cast(TextIO, BrokenPipeSafeWriter(sys.stdout))
+        ),
         cache_logger_on_first_use=True,
     )
 

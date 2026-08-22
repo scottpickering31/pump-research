@@ -29,6 +29,11 @@ from pump_research.market_data.dexscreener import (
     DexScreenerTokenPairsResult,
 )
 from pump_research.market_data.dexscreener_models import DexScreenerPair
+from pump_research.persistence.enrichment import (
+    MetadataCreate,
+    TokenMetadataRepository,
+    TokenSecurityTaskRepository,
+)
 from pump_research.persistence.models import ApiRequestLog
 from pump_research.persistence.repositories import (
     ApiRequestLogRepository,
@@ -87,6 +92,7 @@ class DexAvailabilityWorkflow:
         settings: Settings,
         *,
         logger: structlog.stdlib.BoundLogger | None = None,
+        scheduler: AdaptiveScheduler | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._dex_source = dex_source
@@ -105,17 +111,22 @@ class DexAvailabilityWorkflow:
         self._task_repository = DexAvailabilityTaskRepository()
         self._request_repository = ApiRequestLogRepository()
         self._lifecycle_repository = LifecycleEventRepository()
-        self._adaptive_scheduler = AdaptiveScheduler(session_factory, settings)
+        self._metadata_repository = TokenMetadataRepository()
+        self._security_tasks = TokenSecurityTaskRepository()
+        self._adaptive_scheduler = scheduler or AdaptiveScheduler(session_factory, settings)
 
-    async def admit_discovery(self, event: DiscoveredToken) -> DiscoveryAdmission:
+    async def admit_discovery(
+        self, event: DiscoveredToken, collector_run_id: uuid.UUID | None = None
+    ) -> DiscoveryAdmission:
         """Durably persist a discovery event and create its initial pending task."""
         async with self._session_factory() as session, session.begin():
-            return await self.admit_discovery_in_session(session, event)
+            return await self.admit_discovery_in_session(session, event, collector_run_id)
 
     async def admit_discovery_in_session(
         self,
         session: AsyncSession,
         event: DiscoveredToken,
+        collector_run_id: uuid.UUID | None = None,
     ) -> DiscoveryAdmission:
         """Admit an event inside a batch/checkpoint transaction."""
         token = await self._token_repository.get_or_create(
@@ -124,8 +135,9 @@ class DexAvailabilityWorkflow:
             address=event.address,
             first_discovered_at=event.source_event_at,
         )
-        await self._discovery_repository.record(
+        discovery = await self._discovery_repository.record(
             session,
+            collector_run_id=collector_run_id,
             token_id=token.id,
             idempotency_key=event.idempotency_key,
             provider=event.source_name,
@@ -135,6 +147,30 @@ class DexAvailabilityWorkflow:
             received_at=event.received_at,
             source_payload=dict(event.source_payload),
             source_payload_sha256=event.source_payload_sha256,
+        )
+        payload = event.source_payload
+        await self._metadata_repository.record_if_changed(
+            session,
+            token_id=token.id,
+            pair_id=None,
+            collector_run_id=collector_run_id,
+            api_request_log_id=None,
+            discovery_event_id=discovery.id,
+            provider=event.source_name,
+            source_kind="discovery",
+            source_observed_at=event.source_event_at,
+            received_at=event.received_at,
+            source_record_locator="discovery_event",
+            source_record_sha256=event.source_payload_sha256,
+            metadata=MetadataCreate(
+                name=_optional_text(payload.get("name")),
+                symbol=_optional_text(payload.get("symbol")),
+                metadata_uri=_optional_text(payload.get("uri")),
+                image_url=_optional_text(payload.get("image")),
+                website_url=_optional_text(payload.get("website")),
+                twitter=_optional_text(payload.get("twitter")),
+                telegram=_optional_text(payload.get("telegram")),
+            ),
         )
         task, task_created = await self._task_repository.create_pending_if_absent(
             session,
@@ -152,6 +188,7 @@ class DexAvailabilityWorkflow:
                 input_watermark=event.received_at,
                 reason_code="discovered_awaiting_dex",
                 reason_detail={"discovery_provider": event.source_name},
+                collector_run_id=collector_run_id,
             )
         return DiscoveryAdmission(
             token_id=token.id,
@@ -164,6 +201,7 @@ class DexAvailabilityWorkflow:
         *,
         now: datetime | None = None,
         maximum_tokens: int = TOKEN_BATCH_LIMIT,
+        collector_run_id: uuid.UUID | None = None,
     ) -> DexAvailabilityRunResult:
         """Claim at most one DEX-eligible batch and persist every outcome."""
         if maximum_tokens < 1 or maximum_tokens > TOKEN_BATCH_LIMIT:
@@ -193,6 +231,7 @@ class DexAvailabilityWorkflow:
                 chain=chain,
                 claims=chain_claims,
                 requested_at=check_started_at,
+                collector_run_id=collector_run_id,
             )
             checked += outcome.checked_tokens
             retained += outcome.retained_pending_tokens
@@ -212,6 +251,7 @@ class DexAvailabilityWorkflow:
         chain: str,
         claims: list[DexAvailabilityClaim],
         requested_at: datetime,
+        collector_run_id: uuid.UUID | None,
     ) -> DexAvailabilityRunResult:
         addresses = [claim.address for claim in claims]
         try:
@@ -226,6 +266,7 @@ class DexAvailabilityWorkflow:
                 claims=claims,
                 requested_at=requested_at,
                 error=error,
+                collector_run_id=collector_run_id,
             )
             self._logger.error(
                 "dex_availability_batch_failed",
@@ -255,6 +296,9 @@ class DexAvailabilityWorkflow:
                 claims=claims,
                 requested_at=requested_at,
                 result=result,
+                present_claims=present_claims,
+                absent_claims=absent_claims,
+                collector_run_id=collector_run_id,
             )
             if absent_claims:
                 await self._task_repository.complete_with_retry(
@@ -278,6 +322,7 @@ class DexAvailabilityWorkflow:
                             "api_request_log_id": str(request.id),
                             "next_check_at": (received_at + self._retry_interval).isoformat(),
                         },
+                        collector_run_id=collector_run_id,
                     )
             if present_claims:
                 await self._task_repository.complete_as_new(
@@ -287,6 +332,11 @@ class DexAvailabilityWorkflow:
                     checked_at=received_at,
                 )
                 for claim in present_claims:
+                    await self._security_tasks.create_if_absent(
+                        session,
+                        token_id=claim.token_id,
+                        due_at=received_at,
+                    )
                     await self._record_lifecycle(
                         session,
                         token_id=claim.token_id,
@@ -300,12 +350,14 @@ class DexAvailabilityWorkflow:
                             "api_request_log_id": str(request.id),
                             "matching_pair_count": len(matched_pairs[claim.token_id]),
                         },
+                        collector_run_id=collector_run_id,
                     )
                     await self._adaptive_scheduler.set_lifecycle_state_in_session(
                         session,
                         token_id=claim.token_id,
                         state=LifecycleState.NEW,
                         decided_at=received_at,
+                        collector_run_id=collector_run_id,
                         reason_code="dex_pair_present",
                     )
         self._logger.info(
@@ -331,26 +383,36 @@ class DexAvailabilityWorkflow:
         claims: list[DexAvailabilityClaim],
         requested_at: datetime,
         result: DexScreenerTokenPairsResult,
+        present_claims: list[DexAvailabilityClaim],
+        absent_claims: list[DexAvailabilityClaim],
+        collector_run_id: uuid.UUID | None,
     ) -> ApiRequestLog:
         batch = result.batches[0]
         response_payload = {"pairs": list(batch.raw_response)}
+        outcome = "empty" if not present_claims else "succeeded" if not absent_claims else "partial"
+        failure_detail = (
+            {"unmatched_addresses": [claim.address for claim in absent_claims]}
+            if outcome == "partial"
+            else None
+        )
         return await self._request_repository.record(
             session,
-            collector_run_id=None,
+            collector_run_id=collector_run_id,
             idempotency_key=_idempotency_key("request", str(claims[0].lease_id), chain),
             provider=DEX_SCREENER_PROVIDER,
             endpoint=_DEX_ENDPOINT,
             requested_at=requested_at,
             received_at=batch.received_at,
-            outcome="empty" if not batch.pairs else "succeeded",
+            outcome=outcome,
             http_status_code=200,
             request_payload={
                 "chain_id": chain,
                 "token_addresses": [claim.address for claim in claims],
+                "provider_attempt_count": batch.attempt_count,
             },
             response_payload=response_payload,
             response_payload_sha256=_payload_sha256(response_payload),
-            failure_detail=None,
+            failure_detail=failure_detail,
         )
 
     async def _record_failed_batch(
@@ -360,6 +422,7 @@ class DexAvailabilityWorkflow:
         claims: list[DexAvailabilityClaim],
         requested_at: datetime,
         error: Exception,
+        collector_run_id: uuid.UUID | None,
     ) -> None:
         received_at = datetime.now(UTC)
         status_code = error.status_code if isinstance(error, DexScreenerHttpError) else None
@@ -367,7 +430,7 @@ class DexAvailabilityWorkflow:
         async with self._session_factory() as session, session.begin():
             request = await self._request_repository.record(
                 session,
-                collector_run_id=None,
+                collector_run_id=collector_run_id,
                 idempotency_key=_idempotency_key("failed-request", str(claims[0].lease_id), chain),
                 provider=DEX_SCREENER_PROVIDER,
                 endpoint=_DEX_ENDPOINT,
@@ -378,6 +441,7 @@ class DexAvailabilityWorkflow:
                 request_payload={
                     "chain_id": chain,
                     "token_addresses": [claim.address for claim in claims],
+                    "provider_attempt_count": getattr(error, "dexscreener_attempt_count", 1),
                 },
                 response_payload=None,
                 response_payload_sha256=None,
@@ -404,6 +468,7 @@ class DexAvailabilityWorkflow:
                         "api_request_log_id": str(request.id),
                         "next_check_at": (received_at + self._retry_interval).isoformat(),
                     },
+                    collector_run_id=collector_run_id,
                 )
 
     async def _record_lifecycle(
@@ -418,9 +483,11 @@ class DexAvailabilityWorkflow:
         input_watermark: datetime,
         reason_code: str,
         reason_detail: Mapping[str, object] | None,
+        collector_run_id: uuid.UUID | None = None,
     ) -> None:
         await self._lifecycle_repository.record(
             session,
+            collector_run_id=collector_run_id,
             token_id=token_id,
             idempotency_key=_idempotency_key(*idempotency_parts),
             previous_state=previous_state,
@@ -473,3 +540,7 @@ def _idempotency_key(*parts: str) -> str:
 def _payload_sha256(payload: Mapping[str, object]) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _optional_text(value: object) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None

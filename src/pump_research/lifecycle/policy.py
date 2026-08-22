@@ -52,12 +52,8 @@ class LifecyclePolicy:
     def from_settings(cls, settings: Settings) -> LifecyclePolicy:
         """Create a policy from the complete validated runtime configuration."""
         return cls(
-            new_to_active_min_volume_m5_usd=(
-                settings.lifecycle_new_to_active_min_volume_m5_usd
-            ),
-            new_to_watch_min_liquidity_usd=(
-                settings.lifecycle_new_to_watch_min_liquidity_usd
-            ),
+            new_to_active_min_volume_m5_usd=(settings.lifecycle_new_to_active_min_volume_m5_usd),
+            new_to_watch_min_liquidity_usd=(settings.lifecycle_new_to_watch_min_liquidity_usd),
             active_to_fading_max_volume_m5_usd=(
                 settings.lifecycle_active_to_fading_max_volume_m5_usd
             ),
@@ -101,15 +97,10 @@ class LifecyclePolicy:
                     new_state=LifecycleState.ACTIVE,
                     input_values={"volume_m5_usd": _decimal_text(volume_m5)},
                     thresholds={
-                        "min_volume_m5_usd": _decimal_text(
-                            self.new_to_active_min_volume_m5_usd
-                        )
+                        "min_volume_m5_usd": _decimal_text(self.new_to_active_min_volume_m5_usd)
                     },
                 )
-            if (
-                liquidity is not None
-                and liquidity >= self.new_to_watch_min_liquidity_usd
-            ):
+            if liquidity is not None and liquidity >= self.new_to_watch_min_liquidity_usd:
                 return TransitionEvaluation(
                     rule=LifecycleTransitionRule.NEW_TO_WATCH,
                     previous_state=state,
@@ -122,9 +113,7 @@ class LifecyclePolicy:
                         "max_volume_m5_usd_exclusive": _decimal_text(
                             self.new_to_active_min_volume_m5_usd
                         ),
-                        "min_liquidity_usd": _decimal_text(
-                            self.new_to_watch_min_liquidity_usd
-                        ),
+                        "min_liquidity_usd": _decimal_text(self.new_to_watch_min_liquidity_usd),
                     },
                 )
 
@@ -139,9 +128,7 @@ class LifecyclePolicy:
                 new_state=LifecycleState.FADING,
                 input_values={"volume_m5_usd": _decimal_text(volume_m5)},
                 thresholds={
-                    "max_volume_m5_usd": _decimal_text(
-                        self.active_to_fading_max_volume_m5_usd
-                    )
+                    "max_volume_m5_usd": _decimal_text(self.active_to_fading_max_volume_m5_usd)
                 },
             )
 
@@ -156,9 +143,7 @@ class LifecyclePolicy:
                 new_state=LifecycleState.FADING,
                 input_values={"volume_m5_usd": _decimal_text(volume_m5)},
                 thresholds={
-                    "max_volume_m5_usd": _decimal_text(
-                        self.watch_to_fading_max_volume_m5_usd
-                    )
+                    "max_volume_m5_usd": _decimal_text(self.watch_to_fading_max_volume_m5_usd)
                 },
             )
 
@@ -178,12 +163,8 @@ class LifecyclePolicy:
                     "liquidity_usd": _decimal_text(liquidity),
                 },
                 thresholds={
-                    "max_volume_h1_usd": _decimal_text(
-                        self.fading_to_dormant_max_volume_h1_usd
-                    ),
-                    "max_liquidity_usd": _decimal_text(
-                        self.fading_to_dormant_max_liquidity_usd
-                    ),
+                    "max_volume_h1_usd": _decimal_text(self.fading_to_dormant_max_volume_h1_usd),
+                    "max_liquidity_usd": _decimal_text(self.fading_to_dormant_max_liquidity_usd),
                 },
             )
 

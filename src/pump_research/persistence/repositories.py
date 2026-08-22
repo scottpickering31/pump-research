@@ -2,30 +2,54 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import null, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pump_research.persistence.models import (
     ApiRequestLog,
     CollectorRun,
+    CollectorRunEvent,
+    DeduplicationConflict,
     DexAvailabilityTask,
     DiscoveryCheckpointState,
+    DiscoveryConnectivityEvent,
     DiscoveryEvent,
     LifecycleEvent,
+    LifecycleEvidenceEvaluation,
+    LifecyclePolicy,
     Observation,
     Pair,
     Token,
 )
 
+_EPOCH0_ID = uuid.UUID("00000000-0000-0000-0000-000000000000")
+
 
 class PairTokenMismatchError(ValueError):
     """Raised when a canonical pair is associated with another tracked token."""
+
+
+class LifecyclePolicySnapshotMismatchError(ValueError):
+    """Raised when one policy digest is presented with different policy content."""
+
+
+class CollectorRunTerminalConflictError(RuntimeError):
+    """One run was presented with conflicting terminal-state evidence."""
+
+
+@dataclass(slots=True)
+class _LifecyclePolicyTransactionCache:
+    """Policies already verified inside one database transaction."""
+
+    transaction: object
+    snapshots: dict[str, dict[str, object]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,11 +112,34 @@ class ObservationCreate:
     sells_m5: int | None = None
     buys_h1: int | None = None
     sells_h1: int | None = None
+    buys_h6: int | None = None
+    sells_h6: int | None = None
+    buys_h24: int | None = None
+    sells_h24: int | None = None
+    liquidity_base: Decimal | None = None
+    liquidity_quote: Decimal | None = None
 
 
 async def _load_by_id[T](session: AsyncSession, model: type[T], identifier: uuid.UUID) -> T:
     result = await session.execute(select(model).where(model.id == identifier))  # type: ignore[attr-defined]
     return result.scalar_one()
+
+
+def _record_deduplication_conflict(
+    session: AsyncSession,
+    *,
+    record_type: str,
+    idempotency_key: str,
+    occurred_at: datetime,
+) -> None:
+    """Preserve a rejected duplicate delivery without duplicating accepted facts."""
+    session.add(
+        DeduplicationConflict(
+            record_type=record_type,
+            idempotency_key=idempotency_key,
+            occurred_at=occurred_at,
+        )
+    )
 
 
 class TokenRepository:
@@ -176,10 +223,12 @@ class CollectorRunRepository:
         collector_version: str,
         configuration_sha256: str,
         configuration_snapshot: dict[str, object],
+        collection_epoch_id: uuid.UUID = _EPOCH0_ID,
     ) -> CollectorRun:
         normalized_started_at = _normalize_utc(started_at, "started_at")
         assert normalized_started_at is not None
         run = CollectorRun(
+            collection_epoch_id=collection_epoch_id,
             started_at=normalized_started_at,
             status="running",
             collector_version=collector_version,
@@ -198,9 +247,47 @@ class CollectorRunRepository:
         finished_at: datetime,
         status: str,
         failure_detail: dict[str, object] | None = None,
+        event_type: str | None = None,
     ) -> None:
+        """Atomically finalize one run and append immutable transition evidence.
+
+        Locking the run makes repeated finalization safe across cleanup paths. A
+        retry with the same terminal meaning succeeds; a contradictory terminal
+        result is an explicit integrity error.
+        """
         normalized_finished_at = _normalize_utc(finished_at, "finished_at")
         assert normalized_finished_at is not None
+        if status not in {"stopped", "succeeded", "failed", "cancelled"}:
+            raise ValueError(f"invalid terminal collector-run status: {status}")
+        resolved_event_type = event_type or ("failed" if status == "failed" else "graceful_stop")
+        if resolved_event_type not in {"graceful_stop", "failed", "stale_reconciled"}:
+            raise ValueError(f"invalid collector-run event type: {resolved_event_type}")
+        detail = failure_detail or {}
+        reason = str(detail.get("reason", status))
+        run = await session.scalar(
+            select(CollectorRun).where(CollectorRun.id == run_id).with_for_update()
+        )
+        if run is None:
+            raise LookupError(f"collector run does not exist: {run_id}")
+        if run.status != "running":
+            existing = await session.scalar(
+                select(CollectorRunEvent).where(
+                    CollectorRunEvent.idempotency_key == f"collector-run:{run_id}:terminal"
+                )
+            )
+            if (
+                run.status == status
+                and run.failure_detail == failure_detail
+                and existing is not None
+                and existing.event_type == resolved_event_type
+                and existing.reason == reason
+                and existing.detail == detail
+            ):
+                return
+            raise CollectorRunTerminalConflictError(
+                f"collector run {run_id} is already {run.status}; refused conflicting "
+                f"terminal status {status}"
+            )
         await session.execute(
             update(CollectorRun)
             .where(CollectorRun.id == run_id)
@@ -210,6 +297,17 @@ class CollectorRunRepository:
                 failure_detail=failure_detail,
             )
         )
+        session.add(
+            CollectorRunEvent(
+                collector_run_id=run_id,
+                event_type=resolved_event_type,
+                occurred_at=normalized_finished_at,
+                reason=reason,
+                detail=detail,
+                idempotency_key=f"collector-run:{run_id}:terminal",
+            )
+        )
+        await session.flush()
 
 
 class DiscoveryEventRepository:
@@ -235,6 +333,15 @@ class DiscoveryEventRepository:
             return await _load_by_id(session, DiscoveryEvent, identifier)
 
         key = normalized_values["idempotency_key"]
+        received_at = normalized_values["received_at"]
+        assert isinstance(key, str)
+        assert isinstance(received_at, datetime)
+        _record_deduplication_conflict(
+            session,
+            record_type="discovery_event",
+            idempotency_key=key,
+            occurred_at=received_at,
+        )
         result = await session.execute(
             select(DiscoveryEvent).where(DiscoveryEvent.idempotency_key == key)
         )
@@ -286,10 +393,7 @@ class DiscoveryCheckpointRepository:
                     "coverage_note": coverage_note,
                     "updated_at": normalized_received_at,
                 },
-                where=(
-                    DiscoveryCheckpointState.last_batch_received_at
-                    <= normalized_received_at
-                ),
+                where=(DiscoveryCheckpointState.last_batch_received_at <= normalized_received_at),
             )
             .returning(DiscoveryCheckpointState.source_name)
         )
@@ -301,6 +405,21 @@ class DiscoveryCheckpointRepository:
         if advanced_source is None and state.last_batch_received_at > normalized_received_at:
             return state
         return state
+
+
+class DiscoveryConnectivityEventRepository:
+    """Append idempotent stream connectivity facts without provider coupling."""
+
+    async def record(self, session: AsyncSession, **values: object) -> None:
+        normalized_values = _normalize_timestamp_values(values, ("observed_at",))
+        gap_id = normalized_values.get("gap_id")
+        if isinstance(gap_id, str):
+            normalized_values["gap_id"] = uuid.UUID(gap_id)
+        await session.execute(
+            insert(DiscoveryConnectivityEvent)
+            .values(**normalized_values)
+            .on_conflict_do_nothing(index_elements=[DiscoveryConnectivityEvent.idempotency_key])
+        )
 
 
 class DexAvailabilityTaskRepository:
@@ -491,6 +610,15 @@ class ApiRequestLogRepository:
             return await _load_by_id(session, ApiRequestLog, identifier)
 
         key = normalized_values["idempotency_key"]
+        requested_at = normalized_values["requested_at"]
+        assert isinstance(key, str)
+        assert isinstance(requested_at, datetime)
+        _record_deduplication_conflict(
+            session,
+            record_type="api_request",
+            idempotency_key=key,
+            occurred_at=requested_at,
+        )
         result = await session.execute(
             select(ApiRequestLog).where(ApiRequestLog.idempotency_key == key)
         )
@@ -539,9 +667,184 @@ class ObservationRepository:
                     Observation.pair_id,
                 ]
             )
-            .returning(Observation.id)
+            .returning(Observation.pair_id)
         )
-        return len((await session.execute(statement)).scalars().all())
+        inserted_pair_ids = set((await session.execute(statement)).scalars().all())
+        inserted = len(inserted_pair_ids)
+        if inserted != len(values):
+            for value in values:
+                if value["pair_id"] in inserted_pair_ids:
+                    continue
+                digest = hashlib.sha256(
+                    ":".join(
+                        (
+                            "observation",
+                            api_request.received_at.isoformat(),
+                            str(api_request.id),
+                            str(value["pair_id"]),
+                        )
+                    ).encode()
+                ).hexdigest()
+                _record_deduplication_conflict(
+                    session,
+                    record_type="observation",
+                    idempotency_key=digest,
+                    occurred_at=api_request.received_at,
+                )
+        return inserted
+
+
+class LifecycleEvidenceEvaluationRepository:
+    """Append one reconstructable lifecycle-evidence selection per token response."""
+
+    def __init__(self) -> None:
+        self._policies = LifecyclePolicyRepository()
+
+    async def record(
+        self,
+        session: AsyncSession,
+        *,
+        input_watermark: datetime,
+        token_id: uuid.UUID,
+        api_request_log_id: uuid.UUID,
+        outcome: str,
+        selected_pair_id: uuid.UUID | None,
+        selected_observation_id: uuid.UUID | None,
+        selected_observation_received_at: datetime | None,
+        reason_code: str,
+        reason_detail: dict[str, object],
+        policy_sha256: str,
+        policy_snapshot: dict[str, object],
+    ) -> LifecycleEvidenceEvaluation:
+        normalized_watermark = _normalize_utc(input_watermark, "input_watermark")
+        normalized_observation_at = _normalize_utc(
+            selected_observation_received_at,
+            "selected_observation_received_at",
+        )
+        assert normalized_watermark is not None
+        await self._policies.ensure(
+            session,
+            policy_sha256=policy_sha256,
+            policy_snapshot=policy_snapshot,
+        )
+        conflict_columns = [
+            LifecycleEvidenceEvaluation.input_watermark,
+            LifecycleEvidenceEvaluation.token_id,
+            LifecycleEvidenceEvaluation.api_request_log_id,
+            LifecycleEvidenceEvaluation.policy_sha256,
+        ]
+        statement = (
+            insert(LifecycleEvidenceEvaluation)
+            .values(
+                input_watermark=normalized_watermark,
+                token_id=token_id,
+                api_request_log_id=api_request_log_id,
+                outcome=outcome,
+                selected_pair_id=selected_pair_id,
+                selected_observation_id=selected_observation_id,
+                selected_observation_received_at=normalized_observation_at,
+                reason_code=reason_code,
+                reason_detail=reason_detail,
+                policy_sha256=policy_sha256,
+                # JSONB encodes Python None as JSON `null` by default. Emit an
+                # explicit SQL NULL so normalized-only rows satisfy IS NULL.
+                policy_snapshot=null(),
+            )
+            .on_conflict_do_nothing(index_elements=conflict_columns)
+            .returning(LifecycleEvidenceEvaluation.id)
+        )
+        identifier = (await session.execute(statement)).scalar_one_or_none()
+        if identifier is not None:
+            result = await session.execute(
+                select(LifecycleEvidenceEvaluation).where(
+                    LifecycleEvidenceEvaluation.id == identifier,
+                    LifecycleEvidenceEvaluation.input_watermark == normalized_watermark,
+                )
+            )
+            return result.scalar_one()
+        result = await session.execute(
+            select(LifecycleEvidenceEvaluation).where(
+                LifecycleEvidenceEvaluation.input_watermark == normalized_watermark,
+                LifecycleEvidenceEvaluation.token_id == token_id,
+                LifecycleEvidenceEvaluation.api_request_log_id == api_request_log_id,
+                LifecycleEvidenceEvaluation.policy_sha256 == policy_sha256,
+            )
+        )
+        return result.scalar_one()
+
+    async def resolve_policy_snapshot(
+        self,
+        session: AsyncSession,
+        evaluation: LifecycleEvidenceEvaluation,
+    ) -> dict[str, object]:
+        """Resolve and validate the exact immutable policy used by an evaluation."""
+        policy = await session.get(LifecyclePolicy, evaluation.policy_sha256)
+        if policy is None:
+            msg = (
+                "Lifecycle evidence references a missing normalized policy: "
+                f"{evaluation.policy_sha256}"
+            )
+            raise LookupError(msg)
+        if (
+            evaluation.policy_snapshot is not None
+            and evaluation.policy_snapshot != policy.policy_snapshot
+        ):
+            raise LifecyclePolicySnapshotMismatchError(evaluation.policy_sha256)
+        return dict(policy.policy_snapshot)
+
+
+class LifecyclePolicyRepository:
+    """Idempotently persist one immutable document for each policy digest."""
+
+    _SESSION_CACHE_KEY = "pump_research.lifecycle_policy_transaction_cache"
+
+    async def ensure(
+        self,
+        session: AsyncSession,
+        *,
+        policy_sha256: str,
+        policy_snapshot: dict[str, object],
+    ) -> None:
+        transaction = session.get_transaction()
+        cached = session.info.get(self._SESSION_CACHE_KEY)
+        if (
+            transaction is not None
+            and isinstance(cached, _LifecyclePolicyTransactionCache)
+            and cached.transaction is transaction
+        ):
+            cached_snapshot = cached.snapshots.get(policy_sha256)
+            if cached_snapshot is not None:
+                if cached_snapshot != policy_snapshot:
+                    raise LifecyclePolicySnapshotMismatchError(policy_sha256)
+                return
+
+        statement = (
+            insert(LifecyclePolicy)
+            .values(
+                policy_sha256=policy_sha256,
+                policy_snapshot=policy_snapshot,
+            )
+            .on_conflict_do_nothing(index_elements=[LifecyclePolicy.policy_sha256])
+        )
+        await session.execute(statement)
+        policy = await session.get(LifecyclePolicy, policy_sha256)
+        if policy is None:
+            msg = f"Lifecycle policy insert did not resolve: {policy_sha256}"
+            raise RuntimeError(msg)
+        if policy.policy_snapshot != policy_snapshot:
+            raise LifecyclePolicySnapshotMismatchError(policy_sha256)
+        current_transaction = session.get_transaction()
+        if current_transaction is None:
+            msg = "Lifecycle policy write completed without an active transaction"
+            raise RuntimeError(msg)
+        cached = session.info.get(self._SESSION_CACHE_KEY)
+        if (
+            not isinstance(cached, _LifecyclePolicyTransactionCache)
+            or cached.transaction is not current_transaction
+        ):
+            cached = _LifecyclePolicyTransactionCache(current_transaction, {})
+            session.info[self._SESSION_CACHE_KEY] = cached
+        cached.snapshots[policy_sha256] = dict(policy_snapshot)
 
 
 class LifecycleEventRepository:
@@ -563,6 +866,15 @@ class LifecycleEventRepository:
             return await _load_by_id(session, LifecycleEvent, identifier)
 
         key = normalized_values["idempotency_key"]
+        decided_at = normalized_values["decided_at"]
+        assert isinstance(key, str)
+        assert isinstance(decided_at, datetime)
+        _record_deduplication_conflict(
+            session,
+            record_type="lifecycle_event",
+            idempotency_key=key,
+            occurred_at=decided_at,
+        )
         result = await session.execute(
             select(LifecycleEvent).where(LifecycleEvent.idempotency_key == key)
         )

@@ -7,17 +7,20 @@ uses that state only to choose the next interval and a tie-breaking priority.
 
 | Lifecycle state | Default interval |
 | --- | ---: |
-| `NEW` | 5 seconds |
+| `NEW` | 15 seconds for 2 minutes, then 30 seconds |
 | `ACTIVE` | 5 seconds |
 | `WATCH` | 15 seconds |
-| `FADING` | 60 seconds |
+| `FADING` | 120 seconds |
 | `DORMANT` | 15 minutes |
 | `RESURRECTED` | 5 seconds |
 
-All intervals are configurable through the corresponding
-`PUMP_RESEARCH_SCHEDULER_*_INTERVAL_SECONDS` environment variables. Every
-schedule decision, claimed batch, and completion stores the complete policy
-snapshot and SHA-256 digest used at that time.
+All intervals and capacity headroom are configurable. The scheduler computes
+requested and effective rates every 30 seconds. Static policy documents are
+normalized by SHA-256; immutable capacity decisions store population, demand,
+mode, and target/effective intervals. Schedules, decisions, batches, and members
+reference the responsible capacity decision. See
+[`capacity-aware-scheduler.md`](capacity-aware-scheduler.md) for the algorithm,
+live-population mathematics, simulation, and restart gate.
 
 ## Durable scheduling and restart behavior
 
@@ -42,16 +45,17 @@ concurrent workers from claiming the same schedule. The scheduler creates no
 background or unbounded in-memory queue; `scheduler_max_in_flight_batches`
 bounds outstanding leased batches.
 
-Selection is earliest-due-first. Lifecycle priority breaks equal due times in
-this order: `NEW`, `RESURRECTED`, `ACTIVE`, `WATCH`, `FADING`, `DORMANT`.
-Keeping due time as the primary key means sufficiently overdue dormant work
-cannot be starved by a continuous stream of newly due high-priority work.
+Selection is lifecycle-priority-first in this order: `ACTIVE`, `RESURRECTED`,
+`NEW`, `WATCH`, `FADING`, `DORMANT`; due time and token UUID provide deterministic
+within-tier fairness. Capacity allocation gives every populated tier a positive
+finite rate, so strict priority does not depend on an impossible high-priority
+queue eventually emptying.
 
-Before a batch is claimed, it reserves the DEX client's configured maximum
-attempt count against the rolling one-minute request budget. Claims are
-serialized in PostgreSQL, so multiple scheduler processes cannot collectively
-reserve more request capacity than configured. The HTTP client still applies
-its limiter to every actual attempt and retry.
+Before a batch is claimed, it reserves one normal request against the safe
+rolling budget (192/minute at the default 240 ceiling and 20% headroom). Claims
+are serialized in PostgreSQL, so workers cannot collectively overshoot that
+reservation. Retries and admission requests use the reserved headroom, and the
+HTTP client applies the shared hard limiter to every actual attempt.
 
 ## Lateness measurements
 
@@ -67,20 +71,8 @@ loudly and must be provisioned before the current horizon ends.
 
 ## Network-free load simulation
 
-The integration suite bulk-loads 3,007 auditable token schedules and runs two
-saturated rolling-minute windows using PostgreSQL and a fake clock. It never
-constructs or invokes the DEX Screener client. The scenario reserves three
-possible attempts per 30-address batch against a configured 240-request ceiling.
-
-The deterministic reference result is 160 batches at 100% mean occupancy,
-240 maximum reserved requests per rolling minute, 607 observations still
-overdue, and claim-lateness p50/p95/p99 of 0/60,000/60,000 ms. The overdue count
-is intentional evidence that this token population and cadence can exceed
-available request capacity; it must remain visible to operations and later
-data-quality reporting.
-
-Separate adversarial tests race concurrent claimers, verify that completed
-batches do not release their rolling-window reservation early, and exercise the
-exact 60-second boundary. The HTTP limiter is also driven through two simulated
-minutes of saturated demand to prove that request starts remain within its
-configured rolling ceiling without issuing network traffic.
+Unit simulation runs four hours at the supplied 11,585-token population and a
+separate 30-admissions/minute stress assumption. PostgreSQL integration tests
+also race concurrent claimers and exercise rolling-window boundaries. All use a
+fake clock and no DEX network calls. Measured results are in
+[`capacity-aware-scheduler.md`](capacity-aware-scheduler.md).

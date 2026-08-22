@@ -85,6 +85,7 @@ async def _create_scheduled_observation(
             token_id=token.id,
             state=state,
             decided_at=clock.now(),
+            admitted_at=clock.now(),
             reason_code="test_initial_state",
         )
         if received_at is None:

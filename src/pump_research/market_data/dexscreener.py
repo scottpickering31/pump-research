@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from time import perf_counter
@@ -16,12 +16,16 @@ from tenacity import AsyncRetrying, RetryCallState, retry_if_exception, stop_aft
 from tenacity.wait import wait_exponential
 
 from pump_research.config import Settings
-from pump_research.market_data.dexscreener_models import DexScreenerPair
+from pump_research.market_data.dexscreener_models import (
+    DexScreenerBoostFeedRecord,
+    DexScreenerPair,
+)
 from pump_research.market_data.rate_limiter import AsyncRateLimiter, get_process_rate_limiter
 
 DEX_SCREENER_PROVIDER = "dexscreener"
 TOKEN_BATCH_LIMIT = 30
 _PAIR_LIST_ADAPTER = TypeAdapter(list[DexScreenerPair])
+_BOOST_LIST_ADAPTER = TypeAdapter(list[DexScreenerBoostFeedRecord])
 
 
 class DexScreenerError(RuntimeError):
@@ -73,6 +77,7 @@ class DexScreenerBatchResult:
     pairs: tuple[DexScreenerPair, ...]
     received_at: datetime
     raw_response: tuple[dict[str, Any], ...]
+    attempt_count: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +92,17 @@ class DexScreenerTokenPairsResult:
     def pairs(self) -> tuple[DexScreenerPair, ...]:
         """Flatten pair facts without changing their request provenance."""
         return tuple(pair for batch in self.batches for pair in batch.pairs)
+
+
+@dataclass(frozen=True, slots=True)
+class DexScreenerBoostFeedResult:
+    """Typed and raw evidence from one bounded global boost feed request."""
+
+    feed_kind: str
+    records: tuple[DexScreenerBoostFeedRecord, ...]
+    received_at: datetime
+    raw_response: tuple[dict[str, Any], ...]
+    attempt_count: int = 1
 
 
 def _chunked(values: tuple[str, ...], size: int) -> Iterable[tuple[str, ...]]:
@@ -158,6 +174,7 @@ class DexScreenerClient:
         *,
         http_client: httpx.AsyncClient | None = None,
         rate_limiter: AsyncRateLimiter | None = None,
+        boost_rate_limiter: AsyncRateLimiter | None = None,
         metrics: DexScreenerMetrics | None = None,
         logger: structlog.stdlib.BoundLogger | None = None,
     ) -> None:
@@ -169,6 +186,9 @@ class DexScreenerClient:
         self._owns_http_client = http_client is None
         self._rate_limiter = rate_limiter or get_process_rate_limiter(
             settings.dex_screener_requests_per_minute
+        )
+        self._boost_rate_limiter = boost_rate_limiter or AsyncRateLimiter(
+            settings.dex_screener_boost_route_requests_per_minute
         )
         self.metrics = metrics or DexScreenerMetrics()
         self._logger = logger or structlog.get_logger("pump_research.market_data.dexscreener")
@@ -205,6 +225,35 @@ class DexScreenerClient:
             batches=tuple(results),
         )
 
+    async def fetch_boost_feed(self, *, feed_kind: str) -> DexScreenerBoostFeedResult:
+        """Fetch the bounded global `latest` or `top` boost feed."""
+        if feed_kind not in {"latest", "top"}:
+            raise ValueError("feed_kind must be 'latest' or 'top'")
+        retry_wait = _WaitForRetryAfter(
+            wait_exponential(
+                multiplier=self._settings.dex_screener_retry_backoff_seconds,
+                min=0,
+                max=30,
+            )
+        )
+        attempt_count = 0
+        try:
+            async for attempt in AsyncRetrying(
+                retry=retry_if_exception(_is_retryable),
+                stop=stop_after_attempt(self._settings.dex_screener_max_attempts),
+                wait=retry_wait,
+                reraise=True,
+                before_sleep=self._record_retry,
+            ):
+                attempt_count = attempt.retry_state.attempt_number
+                with attempt:
+                    result = await self._send_boost_request(feed_kind=feed_kind)
+                    return replace(result, attempt_count=attempt_count)
+        except BaseException as error:
+            error.__dict__["dexscreener_attempt_count"] = attempt_count
+            raise
+        raise AssertionError("Tenacity completed without a DEX Screener boost result")
+
     async def _fetch_batch(
         self,
         *,
@@ -221,18 +270,25 @@ class DexScreenerClient:
             )
         )
 
-        async for attempt in AsyncRetrying(
-            retry=retry_if_exception(_is_retryable),
-            stop=stop_after_attempt(self._settings.dex_screener_max_attempts),
-            wait=retry_wait,
-            reraise=True,
-            before_sleep=self._record_retry,
-        ):
-            with attempt:
-                return await self._send_batch_request(
-                    chain_id=chain_id,
-                    token_addresses=token_addresses,
-                )
+        attempt_count = 0
+        try:
+            async for attempt in AsyncRetrying(
+                retry=retry_if_exception(_is_retryable),
+                stop=stop_after_attempt(self._settings.dex_screener_max_attempts),
+                wait=retry_wait,
+                reraise=True,
+                before_sleep=self._record_retry,
+            ):
+                attempt_count = attempt.retry_state.attempt_number
+                with attempt:
+                    result = await self._send_batch_request(
+                        chain_id=chain_id,
+                        token_addresses=token_addresses,
+                    )
+                    return replace(result, attempt_count=attempt_count)
+        except BaseException as error:
+            error.__dict__["dexscreener_attempt_count"] = attempt_count
+            raise
 
         msg = "Tenacity completed without producing a DEX Screener request result"
         raise AssertionError(msg)
@@ -325,6 +381,61 @@ class DexScreenerClient:
             chain_id=chain_id,
             requested_addresses=token_addresses,
             pairs=pairs,
+            received_at=received_at,
+            raw_response=raw_response,
+        )
+
+    async def _send_boost_request(self, *, feed_kind: str) -> DexScreenerBoostFeedResult:
+        """Send one request subject to both application-wide and route-specific limits."""
+        route_wait = await self._boost_rate_limiter.acquire()
+        global_wait = await self._rate_limiter.acquire()
+        self.metrics.rate_limiter_wait_seconds += route_wait + global_wait
+        self.metrics.http_requests_started += 1
+        started = perf_counter()
+        path = f"/token-boosts/{feed_kind}/v1"
+        try:
+            response = await self._http_client.get(path, headers={"Accept": "application/json"})
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            status_code = error.response.status_code
+            if status_code == 429:
+                self.metrics.http_requests_throttled += 1
+            self.metrics.http_requests_failed += 1
+            raise DexScreenerHttpError(
+                status_code=status_code,
+                body_preview=error.response.text[:1_000],
+                retry_after_seconds=_retry_after_seconds(error.response.headers.get("Retry-After")),
+            ) from error
+        except httpx.TransportError:
+            self.metrics.http_requests_failed += 1
+            raise
+        finally:
+            self.metrics.request_latency_seconds += perf_counter() - started
+
+        received_at = datetime.now(UTC)
+        try:
+            payload = response.json()
+            if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+                raise DexScreenerResponseParseError(
+                    "DEX Screener boost response must be a JSON array of objects"
+                )
+            raw_response = tuple(dict(item) for item in payload)
+            records = tuple(_BOOST_LIST_ADAPTER.validate_python(payload))
+        except DexScreenerResponseParseError:
+            self.metrics.parse_failures += 1
+            self.metrics.http_requests_failed += 1
+            raise
+        except (ValueError, ValidationError) as error:
+            self.metrics.parse_failures += 1
+            self.metrics.http_requests_failed += 1
+            raise DexScreenerResponseParseError(
+                "Could not parse DEX Screener boost response"
+            ) from error
+
+        self.metrics.http_requests_succeeded += 1
+        return DexScreenerBoostFeedResult(
+            feed_kind=feed_kind,
+            records=records,
             received_at=received_at,
             raw_response=raw_response,
         )

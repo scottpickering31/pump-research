@@ -21,6 +21,13 @@ class DiscoveryCoverageStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class DiscoveryConnectivityEventType(StrEnum):
+    """Provider-neutral connection facts for a live discovery stream."""
+
+    DISCONNECTED = "disconnected"
+    RECONNECTED = "reconnected"
+
+
 @dataclass(frozen=True, slots=True)
 class DiscoveryCheckpoint:
     """An opaque source-owned cursor or conditional-request validator.
@@ -80,6 +87,26 @@ class DiscoveredToken:
 
 
 @dataclass(frozen=True, slots=True)
+class DiscoveryConnectivityEvent:
+    """Immutable evidence delimiting a discovery stream coverage gap."""
+
+    source_name: str
+    gap_id: str
+    event_type: DiscoveryConnectivityEventType
+    observed_at: datetime
+    reason: str
+    detail: Mapping[str, object]
+    idempotency_key: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("source_name", "gap_id", "reason", "idempotency_key"):
+            if not getattr(self, field_name).strip():
+                msg = f"{field_name} must be non-empty"
+                raise ValueError(msg)
+        _require_utc("observed_at", self.observed_at)
+
+
+@dataclass(frozen=True, slots=True)
 class DiscoveryBatch:
     """The result of one source poll, including its data-quality semantics."""
 
@@ -88,10 +115,11 @@ class DiscoveryBatch:
     coverage: DiscoveryCoverage
     next_checkpoint: DiscoveryCheckpoint | None
     not_modified: bool = False
+    connectivity_events: tuple[DiscoveryConnectivityEvent, ...] = ()
 
     def __post_init__(self) -> None:
         _require_utc("received_at", self.received_at)
-        if self.not_modified and self.events:
+        if self.not_modified and (self.events or self.connectivity_events):
             msg = "A not-modified discovery result cannot contain events"
             raise ValueError(msg)
 
@@ -115,6 +143,15 @@ class TokenDiscoverySource(ABC):
     @abstractmethod
     async def fetch(self, checkpoint: DiscoveryCheckpoint | None = None) -> DiscoveryBatch:
         """Fetch one source-defined batch without exposing provider schema."""
+
+    async def acknowledge(self, batch: DiscoveryBatch) -> None:
+        """Confirm that a fetched batch crossed the caller's durable boundary.
+
+        Replayable poll sources may use the default no-op because their durable
+        checkpoint governs redelivery. Live push sources can retain a batch until
+        this callback occurs after the database transaction commits.
+        """
+        del batch
 
     @abstractmethod
     async def aclose(self) -> None:

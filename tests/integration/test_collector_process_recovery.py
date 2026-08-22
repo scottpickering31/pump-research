@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from pump_research.config import Settings
+from pump_research.epochs import create_epoch
 from pump_research.persistence.models import CollectorRun
 from pump_research.persistence.repositories import (
     DexAvailabilityTaskRepository,
@@ -36,6 +37,9 @@ async def _start_collector_subprocess(
         "PUMP_RESEARCH_DATABASE_URL": database_url,
         "PUMP_RESEARCH_LOG_JSON": "true",
         "PUMP_RESEARCH_LOG_LEVEL": "INFO",
+        # Exercise real process orchestration without contacting the live provider.
+        "PUMP_RESEARCH_PUMPPORTAL_API_KEY": "physical-restart-test-key",
+        "PUMP_RESEARCH_PUMPPORTAL_WEBSOCKET_URL": "wss://127.0.0.1:1/api/data",
     }
     process = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -44,6 +48,8 @@ async def _start_collector_subprocess(
         "pump_research",
         "collector",
         "run",
+        "--epoch",
+        "1",
         cwd=PROJECT_ROOT,
         env=environment,
         stdout=asyncio.subprocess.PIPE,
@@ -83,6 +89,13 @@ async def test_physical_stop_restart_and_sigterm_reconstruct_postgres_state(
     checkpoints = DiscoveryCheckpointRepository()
     now = datetime.now(UTC)
     async with session_factory() as session, session.begin():
+        await create_epoch(
+            session,
+            settings,
+            epoch_number=1,
+            purpose="physical collector restart integration test",
+            now=now,
+        )
         pending_token = await tokens.get_or_create(
             session,
             chain="solana",
@@ -153,11 +166,52 @@ async def test_physical_stop_restart_and_sigterm_reconstruct_postgres_state(
         runs = list((await session.execute(select(CollectorRun))).scalars())
     status_counts = {
         status: sum(run.status == status for run in runs)
-        for status in ("failed", "cancelled")
+        for status in ("failed", "stopped")
     }
-    assert status_counts == {"failed": 1, "cancelled": 1}
+    assert status_counts == {"failed": 1, "stopped": 1}
     failed_run = next(run for run in runs if run.status == "failed")
-    cancelled_run = next(run for run in runs if run.status == "cancelled")
+    stopped_run = next(run for run in runs if run.status == "stopped")
     assert failed_run.failure_detail is not None
     assert failed_run.failure_detail["reason"] == "process_terminated_without_finalization"
-    assert cancelled_run.failure_detail == {"reason": "SIGTERM"}
+    assert stopped_run.failure_detail == {
+        "reason": "operator_requested_shutdown",
+        "signal": "SIGTERM",
+    }
+
+
+@pytest.mark.integration
+async def test_sigint_with_closed_pipeline_stdout_still_finalizes_run(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Model Ctrl+C killing tee while the collector drains against a closed pipe."""
+    engine = session_factory.kw["bind"]
+    assert engine is not None
+    database_url = engine.url.render_as_string(hide_password=False)
+    settings = Settings(database_url=database_url)
+    async with session_factory() as session, session.begin():
+        await create_epoch(
+            session,
+            settings,
+            epoch_number=1,
+            purpose="SIGINT closed-pipeline integration test",
+            now=datetime.now(UTC),
+        )
+
+    process, _ = await _start_collector_subprocess(database_url=database_url)
+    assert process.stdout is not None
+    # Closing the reader reproduces tee exiting from the foreground process
+    # group before Python has completed its durable shutdown bookkeeping.
+    process.stdout._transport.close()  # type: ignore[attr-defined]
+    process.send_signal(signal.SIGINT)
+    await asyncio.wait_for(process.wait(), timeout=5)
+    assert process.returncode == 0
+
+    async with session_factory() as session:
+        run = await session.scalar(select(CollectorRun))
+    assert run is not None
+    assert run.status == "stopped"
+    assert run.finished_at is not None
+    assert run.failure_detail == {
+        "reason": "operator_requested_shutdown",
+        "signal": "SIGINT",
+    }

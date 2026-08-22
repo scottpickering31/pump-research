@@ -44,7 +44,7 @@ Dependencies and infrastructure will be introduced only in approved phases.
 0. Project charter, architectural review, documentation, and directory scaffold.
 1. Tooling baseline, configuration model, testing, and local PostgreSQL setup.
 2. Persistence design and migrations for identities, immutable source facts, attempts, scheduling state, lifecycle history, and configuration history.
-3. Replaceable discovery contract and an initial discovery adapter, including checkpoint and gap semantics.
+3. Replaceable discovery contract and the PumpPortal live adapter, including explicit gap semantics.
 4. DEX Screener client with safe batching, shared rate limiting, response provenance, and tests.
 5. Restart-safe scheduling, leases, lifecycle classification, and adaptive polling.
 6. Operational metrics, collection-gap detection, capacity validation, and 24-hour data-quality reports.
@@ -54,11 +54,14 @@ Each phase requires approval. The implemented cadences and lifecycle-classificat
 
 ## Current status
 
-Phase 2 persistence is complete. The DEX Screener market-data client and provider-neutral discovery boundary are implemented. Initial DEX admission retains `PENDING_DEX` tokens through empty results and promotes them to `NEW` only after a matching DEX pair. The durable adaptive scheduler batches and prioritizes recurring polls for `NEW`, `ACTIVE`, `WATCH`, `FADING`, `DORMANT`, and `RESURRECTED` tokens. The lifecycle classifier applies six configured transitions from immutable observations. Discovery batches advance an opaque provider checkpoint atomically with their durable events. A signal-aware collector control process reconstructs PostgreSQL state, finalizes abandoned runs after hard termination, and handles SIGTERM; continuous collection-worker orchestration remains intentionally absent.
+The DEX Screener market-data client and provider-neutral discovery boundary are implemented. The collector now runs fixed supervised loops that persist discovery, reconcile `PENDING_DEX`, claim adaptive scheduler batches, persist immutable DEX observations, derive lifecycle transitions, and schedule subsequent work. It reconstructs all work from PostgreSQL after restart, records run/component heartbeats, finalizes abandoned runs, and handles SIGINT/SIGTERM without an in-memory token queue.
 
 The DEX Screener client follows the current official [`/tokens/v1` API reference](https://docs.dexscreener.com/api/reference): 30-address batches, a 300-RPM documented endpoint limit, and a 240-RPM default client budget. See [docs/dexscreener.md](docs/dexscreener.md).
 
-See [docs/discovery.md](docs/discovery.md) for the provider-neutral discovery contract and the important coverage limitation of the initial Pump.fun adapter.
+The first database-backed 24-hour collection/data-quality report is implemented. It produces hourly counts, request/latency/rate-limit measures, cadence and gap measures, lifecycle activity, null rates, duplicate-delivery rates, and a database-size snapshot. See [docs/reporting.md](docs/reporting.md).
+
+See [docs/discovery.md](docs/discovery.md) for the provider-neutral discovery contract,
+PumpPortal credential setup, and the live stream's important no-replay coverage limitation.
 
 See [docs/dex_availability.md](docs/dex_availability.md) for the initial `PENDING_DEX → NEW` workflow, batch limit, and restart recovery behavior.
 
@@ -67,6 +70,9 @@ See [docs/scheduler.md](docs/scheduler.md) for adaptive intervals, priority/fair
 See [docs/lifecycle.md](docs/lifecycle.md) for configured lifecycle transitions, their evidence, temporal safeguards, and the intentionally limited current scope.
 
 See [docs/reliability.md](docs/reliability.md) for fault-injection coverage and the physical collector stop/restart test.
+
+See [docs/commands.md](docs/commands.md) for a compact application, database,
+reporting, and development command reference.
 
 ## Local development setup
 
@@ -82,14 +88,46 @@ docker compose up -d
 docker compose ps
 python -m alembic upgrade head
 python -m pump_research database health
-python -m pytest
+python -m pump_research epoch list
+docker compose exec -T postgres createdb -U pump_research pump_research_capacity_test
+PUMP_RESEARCH_ENVIRONMENT=test PUMP_RESEARCH_TEST_DATABASE_URL='postgresql+asyncpg://pump_research:pump_research@localhost:5433/pump_research_capacity_test' python -m pytest
 python -m ruff check .
 python -m mypy
 ```
 
-`docker compose ps` reports `healthy` after PostgreSQL passes its health check. The database uses the named `postgres_data` Docker volume and therefore persists across container recreation. Apply database migrations with `make migrate`. For convenience, equivalent commands are available through `make db-up`, `make db-status`, `make db-health`, and `make check` once the virtual environment exists.
+`docker compose ps` reports `healthy` after PostgreSQL passes its health check.
+The collector database uses the named `postgres_data` Docker volume. Integration
+tests require an explicit test URL and `PUMP_RESEARCH_ENVIRONMENT=test`; the
+fixture checks PostgreSQL's actual connected database name immediately before
+destructive SQL. Apply collector database migrations with `make migrate`.
 
-Copy `.env.example` to `.env` for local overrides. `.env` is ignored by Git; never commit credentials or connection strings for shared environments.
+Copy `.env.example` to `.env` for local overrides. `.env` is ignored by Git; never commit
+credentials or connection strings for shared environments. Before a live collector run, obtain a
+PumpPortal API key using its official [Getting Started](https://pumpportal.fun/trading-api/setup/)
+page and set `PUMP_RESEARCH_PUMPPORTAL_API_KEY`. The application neither creates nor stores the
+linked wallet or its private key.
+
+`python -m pump_research report 24h --epoch 1` writes Markdown, JSON, and hourly
+CSV. Use `--end-at 2026-08-14T12:00:00Z` to reproduce a
+past UTC-aligned window and `--output-directory path/to/output` to choose a
+different destination.
+
+Start a live collector only after setting the PumpPortal API key and reviewing
+the live WebSocket source's no-replay coverage risk:
+
+```bash
+python -m pump_research epoch create --number 1 --purpose 'first valid 24-hour research collection'
+python -m pump_research collector run --epoch 1
+python -m pump_research collector status
+python -m pump_research report 24h --epoch 1
+```
+
+`collector run` continues until SIGINT or SIGTERM. `collector status` is a
+read-only JSON snapshot of durable run health, discovery connectivity, DEX
+request use, token/state totals, schedule lateness, and database size.
+PostgreSQL permits only one live collector process for a database, ensuring
+reconciliation and observation requests share the configured DEX Screener
+budget; a second invocation exits rather than running split-brain.
 
 The default host port is `5433` because many local PostgreSQL installations already use `5432`; PostgreSQL remains on `5432` inside the Compose network. Update both `PUMP_RESEARCH_DATABASE_URL` and `compose.yaml` if a different host port is required.
 
@@ -107,6 +145,7 @@ The default host port is `5433` because many local PostgreSQL installations alre
 │   ├── dex_availability.md  # durable initial DEX-admission workflow
 │   ├── discovery.md         # discovery contract and coverage semantics
 │   ├── lifecycle.md         # configured transition evidence and safeguards
+│   ├── reporting.md         # 24-hour collection/data-quality report semantics
 │   ├── reliability.md       # fault injection and physical restart coverage
 │   └── scheduler.md         # adaptive cadence, priority, and recovery
 ├── src/

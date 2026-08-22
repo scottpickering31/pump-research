@@ -39,13 +39,23 @@ def _sample_pair() -> dict[str, object]:
         "quoteToken": {"address": "So111", "name": "Wrapped SOL", "symbol": "SOL"},
         "priceNative": "0.00001",
         "priceUsd": "0.00123",
-        "txns": {"m5": {"buys": 2, "sells": 1}},
+        "txns": {
+            "m5": {"buys": 2, "sells": 1},
+            "h6": {"buys": 23, "sells": 11},
+            "h24": {"buys": 50, "sells": 40},
+        },
         "volume": {"m5": 12.5},
         "priceChange": {"m5": -1.25},
-        "liquidity": {"usd": 1234.5},
+        "liquidity": {"usd": 1234.5, "base": "1200000", "quote": "4.5"},
         "fdv": 2000,
         "marketCap": 1900,
         "pairCreatedAt": 1_700_000_000_000,
+        "info": {
+            "imageUrl": "https://example.test/token.png",
+            "websites": [{"label": "site", "url": "https://example.test"}],
+            "socials": [{"platform": "twitter", "handle": "example"}],
+        },
+        "boosts": {"active": 0},
     }
 
 
@@ -76,6 +86,13 @@ async def test_thirty_addresses_issue_one_eligible_batched_request() -> None:
     assert result.requested_addresses == tuple(addresses)
     assert len(result.batches) == 1
     assert result.pairs[0].price_usd == Decimal("0.00123")
+    assert result.pairs[0].txns["h6"].buys == 23
+    assert result.pairs[0].txns["h24"].sells == 40
+    assert result.pairs[0].liquidity is not None
+    assert result.pairs[0].liquidity.base == Decimal("1200000")
+    assert result.pairs[0].pair_created_at == 1_700_000_000_000
+    assert result.pairs[0].boosts is not None
+    assert result.pairs[0].boosts.active == 0
     assert metrics.batches_requested == 1
     assert metrics.addresses_requested == 30
     assert metrics.http_requests_started == 1
@@ -130,6 +147,7 @@ async def test_throttled_request_retries_through_the_client() -> None:
         result = await client.fetch_token_pairs(chain_id="solana", token_addresses=["token-0"])
 
     assert result.pairs == ()
+    assert result.batches[0].attempt_count == 2
     assert attempts == 2
     assert metrics.retries == 1
     assert metrics.http_requests_throttled == 1
@@ -155,13 +173,14 @@ async def test_http_timeout_retries_then_surfaces_failure() -> None:
             rate_limiter=_fast_limiter(),
             metrics=metrics,
         )
-        with pytest.raises(httpx.ReadTimeout, match="simulated timeout"):
+        with pytest.raises(httpx.ReadTimeout, match="simulated timeout") as captured:
             await client.fetch_token_pairs(
                 chain_id="solana",
                 token_addresses=["timeout-token"],
             )
 
     assert attempts == 2
+    assert captured.value.__dict__["dexscreener_attempt_count"] == 2
     assert metrics.retries == 1
     assert metrics.http_requests_failed == 2
 
@@ -193,6 +212,7 @@ async def test_server_error_retries_through_rate_limiter() -> None:
         )
 
     assert result.pairs == ()
+    assert result.batches[0].attempt_count == 2
     assert attempts == 2
     assert metrics.retries == 1
     assert metrics.http_requests_failed == 1
@@ -252,3 +272,54 @@ async def test_invalid_json_is_explicit_parse_error_without_retry() -> None:
     assert requests == 1
     assert metrics.parse_failures == 1
     assert metrics.retries == 0
+
+
+@pytest.mark.asyncio
+async def test_global_boost_feed_preserves_zero_and_nullable_numeric_facts() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/token-boosts/latest/v1"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "chainId": "solana",
+                    "tokenAddress": "token-0",
+                    "amount": 0,
+                    "totalAmount": None,
+                }
+            ],
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url=TEST_BASE_URL
+    ) as http:
+        client = DexScreenerClient(
+            _settings(),
+            http_client=http,
+            rate_limiter=_fast_limiter(),
+            boost_rate_limiter=_fast_limiter(),
+        )
+        result = await client.fetch_boost_feed(feed_kind="latest")
+
+    assert result.records[0].amount == Decimal("0")
+    assert result.records[0].total_amount is None
+    assert "amount" in result.records[0].model_fields_set
+    assert "total_amount" in result.records[0].model_fields_set
+
+
+@pytest.mark.asyncio
+async def test_global_boost_feed_rejects_non_list_shape() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"tokenAddress": "token-0"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url=TEST_BASE_URL
+    ) as http:
+        client = DexScreenerClient(
+            _settings(),
+            http_client=http,
+            rate_limiter=_fast_limiter(),
+            boost_rate_limiter=_fast_limiter(),
+        )
+        with pytest.raises(DexScreenerResponseParseError, match="JSON array"):
+            await client.fetch_boost_feed(feed_kind="top")

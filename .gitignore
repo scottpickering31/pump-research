@@ -70,3 +70,7 @@ archives/*
 logs/*
 !logs/.gitkeep
 *.log
+
+# Generated operational reports
+reports/*
+!reports/.gitkeep
