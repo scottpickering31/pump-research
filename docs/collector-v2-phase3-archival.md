@@ -244,6 +244,19 @@ it sends content length and SHA-256, then HEADs and fully reads the uploaded obj
 Provider credentials are owned by the injected SDK/environment and never enter a
 manifest. No AWS, Hetzner, Cloudflare, or other vendor is hard-coded.
 
+Production S3-compatible wiring uses the standard Boto3 S3 client with an exact
+operator-configured HTTPS endpoint, explicit region and SigV4 signing. Bucket and
+object prefix remain provider-neutral. Access-key ID and secret-key settings use
+`SecretStr`, cannot be supplied in endpoint query/userinfo data, and are excluded from
+epoch/runtime configuration snapshots and command output. SDK failures are translated
+to credential-free storage errors.
+
+`archive s3-readiness` safely writes one deterministic content-addressed probe below a
+reserved readiness namespace, HEADs and fully reads it, and reports SHA-256 `PASS` or
+credential-free `FAIL`. The probe is not deleted. `archive copy-s3` and
+`archive verify-s3-copy` use the same catalog verification and explicit secondary-copy
+independence gate as filesystem copies. No S3 delete operation is exposed.
+
 `secondary` verification requires an explicit operator assertion plus explanation of
 the independent failure domain. Merely choosing another directory is not treated as
 proof of physical independence.

@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from pump_research.config import Settings
+from pump_research.config import CONFIGURATION_SNAPSHOT_EXCLUDED_FIELDS, Settings
 from pump_research.persistence.models import (
     CollectionEpoch,
     CollectionEpochCurrent,
@@ -78,9 +78,9 @@ def epoch_configuration(settings: Settings, epoch_number: int) -> tuple[str, dic
         "epoch_number": epoch_number,
         "settings": settings.model_dump(
             mode="json",
-            exclude={"database_url", "pumpportal_api_key", "solana_rpc_url"},
+            exclude=set(CONFIGURATION_SNAPSHOT_EXCLUDED_FIELDS),
         ),
-        "excluded_secret_fields": ["database_url", "pumpportal_api_key", "solana_rpc_url"],
+        "excluded_secret_fields": sorted(CONFIGURATION_SNAPSHOT_EXCLUDED_FIELDS),
     }
     encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest(), snapshot

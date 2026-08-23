@@ -16,7 +16,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, async_sessionmaker
 
 from pump_research import __version__
-from pump_research.config import Settings
+from pump_research.config import CONFIGURATION_SNAPSHOT_EXCLUDED_FIELDS, Settings
 from pump_research.epochs import start_epoch_with_result
 from pump_research.persistence.models import (
     CollectorRun,
@@ -381,13 +381,13 @@ async def _read_durable_state(
 def _safe_configuration_snapshot(settings: Settings) -> dict[str, object]:
     values = settings.model_dump(
         mode="json",
-        exclude={"database_url", "pumpportal_api_key", "solana_rpc_url"},
+        exclude=set(CONFIGURATION_SNAPSHOT_EXCLUDED_FIELDS),
     )
     return {
         "component": "collector_runtime",
         "schema_version": 1,
         "settings": values,
-        "excluded_secret_fields": ["database_url", "pumpportal_api_key", "solana_rpc_url"],
+        "excluded_secret_fields": sorted(CONFIGURATION_SNAPSHOT_EXCLUDED_FIELDS),
     }
 
 

@@ -692,14 +692,6 @@ async def test_four_phase6_workers_claim_once_persist_as_of_and_promote_tier3(
         ("WALLET_CLUSTER_ANALYSIS", "pending"),
     ]
 
-    histories = await PostgresResearchSource(session_factory).load_histories(
-        epoch_number=5, token_addresses=["phase5-token"]
-    )
-    before = get_token_state_as_of(histories[0], NOW + timedelta(seconds=1))
-    after = get_token_state_as_of(histories[0], NOW + timedelta(seconds=2))
-    assert before.holder_snapshot is None
-    assert after.holder_snapshot is not None
-    assert after.security_features is not None
     deep_claims = await asyncio.gather(
         *(
             worker.run_once(
@@ -735,6 +727,17 @@ async def test_four_phase6_workers_claim_once_persist_as_of_and_promote_tier3(
             or 0
         )
     assert tier3_promotions == 1
+    # Compare hot and cold state from the same completed fact set. The fixture gives
+    # every concurrent provider response the same receipt time, so loading hot state
+    # before the deep tasks would make later rows eligible at the same as-of cutoff.
+    histories = await PostgresResearchSource(session_factory).load_histories(
+        epoch_number=5, token_addresses=["phase5-token"]
+    )
+    before = get_token_state_as_of(histories[0], NOW + timedelta(seconds=1))
+    after = get_token_state_as_of(histories[0], NOW + timedelta(seconds=2))
+    assert before.holder_snapshot is None
+    assert after.holder_snapshot is not None
+    assert after.security_features is not None
     restarted = CandidateOrchestrationService(
         session_factory,
         CandidatePolicy.from_settings(_settings()),

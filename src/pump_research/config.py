@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
 from urllib.parse import urlsplit
@@ -10,6 +12,30 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
+
+CONFIGURATION_SNAPSHOT_EXCLUDED_FIELDS = (
+    "archive_s3_access_key_id",
+    "archive_s3_secret_access_key",
+    "database_url",
+    "pumpportal_api_key",
+    "solana_rpc_url",
+)
+
+
+class ArchiveS3ConfigurationError(RuntimeError):
+    """Required S3-compatible archive configuration is absent or unsafe."""
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveS3Configuration:
+    """Validated values used only at the S3 SDK construction boundary."""
+
+    endpoint_url: str
+    bucket: str
+    prefix: str
+    access_key_id: SecretStr
+    secret_access_key: SecretStr
+    region: str
 
 
 class Settings(BaseSettings):
@@ -20,6 +46,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         env_prefix="PUMP_RESEARCH_",
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     environment: str = "development"
@@ -135,6 +162,12 @@ class Settings(BaseSettings):
     archive_max_file_rows: int = Field(default=1_000_000, ge=25_000, le=10_000_000)
     archive_minimum_free_bytes: int = Field(default=2 * 1024**3, ge=256 * 1024**2)
     archive_minimum_hot_retention_days: int = Field(default=14, ge=1, le=365)
+    archive_s3_endpoint_url: str | None = None
+    archive_s3_bucket: str | None = None
+    archive_s3_prefix: str | None = None
+    archive_s3_access_key_id: SecretStr | None = None
+    archive_s3_secret_access_key: SecretStr | None = None
+    archive_s3_region: str | None = None
     lifecycle_new_to_active_min_volume_m5_usd: Decimal = Field(default=Decimal("100"), ge=0)
     lifecycle_new_to_watch_min_liquidity_usd: Decimal = Field(default=Decimal("1000"), ge=0)
     lifecycle_active_to_fading_max_volume_m5_usd: Decimal = Field(default=Decimal("25"), ge=0)
@@ -217,6 +250,80 @@ class Settings(BaseSettings):
             )
         return value.rstrip("/")
 
+    @field_validator("archive_s3_endpoint_url")
+    @classmethod
+    def validate_archive_s3_endpoint_url(cls, value: str | None) -> str | None:
+        """Require a TLS endpoint with no credential-bearing URL components."""
+        if value is None:
+            return None
+        if value != value.strip():
+            raise ValueError("PUMP_RESEARCH_ARCHIVE_S3_ENDPOINT_URL must not contain whitespace")
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.hostname is None
+            or any(character.isspace() or ord(character) < 32 for character in value)
+        ):
+            raise ValueError(
+                "PUMP_RESEARCH_ARCHIVE_S3_ENDPOINT_URL must be a valid https:// URL"
+            )
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError(
+                "PUMP_RESEARCH_ARCHIVE_S3_ENDPOINT_URL must not contain credentials"
+            )
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise ValueError(
+                "PUMP_RESEARCH_ARCHIVE_S3_ENDPOINT_URL must not contain "
+                "path, query, or fragment data"
+            )
+        try:
+            _ = parsed.port
+        except ValueError as error:
+            raise ValueError(
+                "PUMP_RESEARCH_ARCHIVE_S3_ENDPOINT_URL must contain a valid port"
+            ) from error
+        return value
+
+    @field_validator("archive_s3_bucket")
+    @classmethod
+    def validate_archive_s3_bucket(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{1,253}[A-Za-z0-9]", value):
+            raise ValueError(
+                "PUMP_RESEARCH_ARCHIVE_S3_BUCKET must be a valid S3-compatible bucket name"
+            )
+        return value
+
+    @field_validator("archive_s3_prefix")
+    @classmethod
+    def validate_archive_s3_prefix(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not value
+            or value != value.strip()
+            or value.startswith("/")
+            or value.endswith("/")
+            or "\\" in value
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError(
+                "PUMP_RESEARCH_ARCHIVE_S3_PREFIX must be a non-empty relative object prefix"
+            )
+        return value
+
+    @field_validator("archive_s3_region")
+    @classmethod
+    def validate_archive_s3_region(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,62}", value):
+            raise ValueError("PUMP_RESEARCH_ARCHIVE_S3_REGION must be a valid SDK region")
+        return value
+
     @field_validator("pumpportal_api_key", mode="before")
     @classmethod
     def reject_blank_pumpportal_api_key(cls, value: object) -> object:
@@ -238,6 +345,52 @@ class Settings(BaseSettings):
         if not secret.strip():
             raise ValueError("PUMP_RESEARCH_SECURITY_INDEXER_API_KEY must not be blank")
         return secret.strip()
+
+    @field_validator("archive_s3_access_key_id", "archive_s3_secret_access_key", mode="before")
+    @classmethod
+    def reject_blank_archive_s3_credentials(cls, value: object) -> object:
+        if value is None:
+            return None
+        secret = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
+        if not secret.strip():
+            raise ValueError("S3-compatible archive credentials must not be blank")
+        return secret.strip()
+
+    def require_archive_s3_configuration(self) -> ArchiveS3Configuration:
+        """Return complete S3 settings without permitting SDK credential fallback."""
+        names_and_values = {
+            "PUMP_RESEARCH_ARCHIVE_S3_ENDPOINT_URL": self.archive_s3_endpoint_url,
+            "PUMP_RESEARCH_ARCHIVE_S3_BUCKET": self.archive_s3_bucket,
+            "PUMP_RESEARCH_ARCHIVE_S3_PREFIX": self.archive_s3_prefix,
+            "PUMP_RESEARCH_ARCHIVE_S3_ACCESS_KEY_ID": self.archive_s3_access_key_id,
+            "PUMP_RESEARCH_ARCHIVE_S3_SECRET_ACCESS_KEY": self.archive_s3_secret_access_key,
+            "PUMP_RESEARCH_ARCHIVE_S3_REGION": self.archive_s3_region,
+        }
+        missing = [name for name, value in names_and_values.items() if value is None]
+        if missing:
+            raise ArchiveS3ConfigurationError(
+                "S3-compatible archive configuration is incomplete; missing " + ", ".join(missing)
+            )
+        endpoint_url = self.archive_s3_endpoint_url
+        bucket = self.archive_s3_bucket
+        prefix = self.archive_s3_prefix
+        access_key_id = self.archive_s3_access_key_id
+        secret_access_key = self.archive_s3_secret_access_key
+        region = self.archive_s3_region
+        assert endpoint_url is not None
+        assert bucket is not None
+        assert prefix is not None
+        assert access_key_id is not None
+        assert secret_access_key is not None
+        assert region is not None
+        return ArchiveS3Configuration(
+            endpoint_url=endpoint_url,
+            bucket=bucket,
+            prefix=prefix,
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            region=region,
+        )
 
 
 @lru_cache

@@ -7,7 +7,9 @@ import base64
 import hashlib
 import json
 import os
+import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Protocol, cast
@@ -16,6 +18,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from pump_research.archival import ArchiveConflictError, verify_archive
 from pump_research.archive_catalog import ArchiveCatalogError, record_copy_verification
+from pump_research.config import Settings
+
+READINESS_CONTENT = b"pump-research:s3-compatible-archive-readiness:v1\n"
+READINESS_SHA256 = hashlib.sha256(READINESS_CONTENT).hexdigest()
+READINESS_OBJECT_KEY = f"_readiness/pump-research/archive-storage/v1/{READINESS_SHA256}.txt"
+
+
+class S3CompatibleStorageError(RuntimeError):
+    """Credential-free failure raised at the S3-compatible SDK boundary."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,13 +118,25 @@ class S3CompatibleObjectStore:
 
     provider_kind = "s3_compatible"
 
-    def __init__(self, *, client: S3ClientProtocol, bucket: str, prefix: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        client: S3ClientProtocol,
+        bucket: str,
+        prefix: str = "",
+        endpoint_url: str | None = None,
+    ) -> None:
         if not bucket:
             raise ValueError("S3-compatible bucket is required")
         self.client = client
         self.bucket = bucket
         self.prefix = prefix.strip("/")
-        self.location = f"s3://{bucket}/{self.prefix}".rstrip("/")
+        if endpoint_url is None:
+            self.location = f"s3://{bucket}/{self.prefix}".rstrip("/")
+        else:
+            self.location = "/".join(
+                part for part in (endpoint_url.rstrip("/"), bucket, self.prefix) if part
+            )
 
     async def put_file(self, *, key: str, source: Path, sha256: str) -> StoredObject:
         object_key = self._key(key)
@@ -127,15 +150,22 @@ class S3CompatibleObjectStore:
             return StoredObject(key, existing.content_length, readback)
 
         def upload() -> None:
-            with source.open("rb") as handle:
-                self.client.put_object(
-                    Bucket=self.bucket,
-                    Key=object_key,
-                    Body=handle,
-                    ContentLength=source.stat().st_size,
-                    ChecksumSHA256=base64.b64encode(bytes.fromhex(sha256)).decode("ascii"),
-                    Metadata={"sha256": sha256},
-                )
+            try:
+                with source.open("rb") as handle:
+                    self.client.put_object(
+                        Bucket=self.bucket,
+                        Key=object_key,
+                        Body=handle,
+                        ContentLength=source.stat().st_size,
+                        ChecksumSHA256=base64.b64encode(bytes.fromhex(sha256)).decode("ascii"),
+                        Metadata={"sha256": sha256},
+                    )
+            except OSError:
+                raise
+            except Exception:
+                raise S3CompatibleStorageError(
+                    f"S3-compatible PUT failed for object key {object_key}"
+                ) from None
 
         await asyncio.to_thread(upload)
         stored = await self.stat(key)
@@ -156,7 +186,9 @@ class S3CompatibleObjectStore:
                 code = str(response.get("Error", {}).get("Code", ""))
                 if code in {"404", "NoSuchKey", "NotFound"}:
                     return None
-                raise
+                raise S3CompatibleStorageError(
+                    f"S3-compatible HEAD failed for object key {object_key}"
+                ) from None
 
         response = await asyncio.to_thread(head)
         if response is None:
@@ -168,17 +200,24 @@ class S3CompatibleObjectStore:
         object_key = self._key(key)
 
         def download_hash() -> str:
-            response = self.client.get_object(Bucket=self.bucket, Key=object_key)
-            body = cast(BinaryIO, response["Body"])
-            digest = hashlib.sha256()
             try:
-                for block in iter(lambda: body.read(1024 * 1024), b""):
-                    digest.update(block)
-            finally:
-                close = getattr(body, "close", None)
-                if close is not None:
-                    close()
-            return digest.hexdigest()
+                response = self.client.get_object(Bucket=self.bucket, Key=object_key)
+                body = cast(BinaryIO, response["Body"])
+                digest = hashlib.sha256()
+                try:
+                    for block in iter(lambda: body.read(1024 * 1024), b""):
+                        digest.update(block)
+                finally:
+                    close = getattr(body, "close", None)
+                    if close is not None:
+                        close()
+                return digest.hexdigest()
+            except Exception as error:
+                if isinstance(error, S3CompatibleStorageError):
+                    raise
+                raise S3CompatibleStorageError(
+                    f"S3-compatible GET failed for object key {object_key}"
+                ) from None
 
         return await asyncio.to_thread(download_hash)
 
@@ -187,6 +226,75 @@ class S3CompatibleObjectStore:
         if pure.is_absolute() or ".." in pure.parts:
             raise ValueError("archive object key must be relative and cannot traverse")
         return "/".join(part for part in (self.prefix, pure.as_posix()) if part)
+
+
+def create_s3_compatible_object_store(
+    settings: Settings,
+    *,
+    client_factory: Callable[..., S3ClientProtocol] | None = None,
+) -> S3CompatibleObjectStore:
+    """Build the standard SigV4 SDK client from explicit, complete settings."""
+    configuration = settings.require_archive_s3_configuration()
+    try:
+        if client_factory is None:
+            import boto3  # type: ignore[import-untyped]
+            from botocore.config import Config  # type: ignore[import-untyped]
+
+            client_factory = cast(Callable[..., S3ClientProtocol], boto3.client)
+            sdk_config: object = Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+            )
+        else:
+            sdk_config = None
+        kwargs: dict[str, object] = {
+            "endpoint_url": configuration.endpoint_url,
+            "aws_access_key_id": configuration.access_key_id.get_secret_value(),
+            "aws_secret_access_key": configuration.secret_access_key.get_secret_value(),
+            "region_name": configuration.region,
+        }
+        if sdk_config is not None:
+            kwargs["config"] = sdk_config
+        client = client_factory("s3", **kwargs)
+    except Exception:
+        raise S3CompatibleStorageError(
+            "S3-compatible SDK client initialization failed"
+        ) from None
+    return S3CompatibleObjectStore(
+        client=client,
+        bucket=configuration.bucket,
+        prefix=configuration.prefix,
+        endpoint_url=configuration.endpoint_url,
+    )
+
+
+async def check_s3_compatible_readiness(
+    store: S3CompatibleObjectStore,
+) -> dict[str, object]:
+    """Upload and fully read a deterministic probe; deliberately never delete it."""
+    with tempfile.TemporaryDirectory(prefix="pump-research-s3-readiness-") as directory:
+        source = Path(directory) / "readiness.txt"
+        source.write_bytes(READINESS_CONTENT)
+        stored = await store.put_file(
+            key=READINESS_OBJECT_KEY,
+            source=source,
+            sha256=READINESS_SHA256,
+        )
+    headed = await store.stat(READINESS_OBJECT_KEY)
+    if headed is None or headed.content_length != len(READINESS_CONTENT):
+        raise S3CompatibleStorageError("S3-compatible readiness HEAD verification failed")
+    readback_sha256 = await store.sha256_readback(READINESS_OBJECT_KEY)
+    if readback_sha256 != READINESS_SHA256:
+        raise S3CompatibleStorageError("S3-compatible readiness SHA-256 verification failed")
+    return {
+        "status": "PASS",
+        "provider_kind": store.provider_kind,
+        "location": store.location,
+        "object_key": stored.key,
+        "bytes": stored.content_length,
+        "sha256": readback_sha256,
+        "delete_attempted": False,
+    }
 
 
 async def copy_archive(
@@ -253,6 +361,70 @@ async def copy_archive(
         "bytes": sum(cast(int, item["bytes"]) for item in objects),
         "manifest_sha256": verification["manifest_sha256"],
         "aggregate_file_sha256": verification["aggregate_file_sha256"],
+        "independence_asserted": independence_asserted,
+    }
+
+
+async def verify_object_store_copy(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    source_manifest: Path,
+    store: ArchiveObjectStore,
+    copy_role: str,
+    independence_asserted: bool,
+    independence_detail: str | None,
+) -> dict[str, object]:
+    """Fully re-read an existing object-store copy before recording verification."""
+    if copy_role == "secondary" and not independence_asserted:
+        raise ArchiveCatalogError(
+            "secondary archive copy requires an explicit independence assertion"
+        )
+    source_verification = await verify_archive(source_manifest)
+    manifest = json.loads(source_manifest.read_text(encoding="utf-8"))
+    if int(manifest.get("archive_schema_version", 0)) != 2:
+        raise ValueError("production archive copy verification requires archive schema version 2")
+    root = source_manifest.resolve().parents[4]
+    data_paths = [root / entry["file"] for entry in manifest["entries"]]
+    ordered = [*data_paths, source_manifest.with_name("manifest.sha256"), source_manifest]
+    objects: list[dict[str, object]] = []
+    for source in ordered:
+        key = source.resolve().relative_to(root).as_posix()
+        expected_sha256 = _sha256_file(source)
+        stored = await store.stat(key)
+        if stored is None:
+            raise ArchiveConflictError(f"archive copy object is missing: {key}")
+        if stored.content_length != source.stat().st_size:
+            raise ArchiveConflictError(f"archive copy content length differs: {key}")
+        if await store.sha256_readback(key) != expected_sha256:
+            raise ArchiveConflictError(f"archive copy readback checksum differs: {key}")
+        objects.append(
+            {"key": key, "bytes": stored.content_length, "sha256": expected_sha256}
+        )
+    total_bytes = sum(cast(int, item["bytes"]) for item in objects)
+    await record_copy_verification(
+        session_factory,
+        scope_id=uuid.UUID(manifest["archive_scope_id"]),
+        copy_role=copy_role,
+        provider_kind=store.provider_kind,
+        location=store.location,
+        manifest_sha256=cast(str, source_verification["manifest_sha256"]),
+        aggregate_file_sha256=cast(str, source_verification["aggregate_file_sha256"]),
+        total_bytes=total_bytes,
+        object_count=len(objects),
+        independence_asserted=independence_asserted,
+        independence_detail=independence_detail,
+        verification_method="content-length + full SHA256 independent object-store readback",
+        detail={"objects": objects, "existing_copy_readback": True},
+    )
+    return {
+        "verified": True,
+        "copy_role": copy_role,
+        "provider_kind": store.provider_kind,
+        "location": store.location,
+        "object_count": len(objects),
+        "bytes": total_bytes,
+        "manifest_sha256": source_verification["manifest_sha256"],
+        "aggregate_file_sha256": source_verification["aggregate_file_sha256"],
         "independence_asserted": independence_asserted,
     }
 

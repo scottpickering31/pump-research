@@ -16,14 +16,23 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from pump_research.archival import archive_stats, export_epoch_range, verify_archive
+from pump_research.archival import (
+    ArchiveConflictError,
+    archive_stats,
+    export_epoch_range,
+    verify_archive,
+)
 from pump_research.archive_analytics import run_archive_analytics
 from pump_research.archive_benchmark import benchmark_observation_window
 from pump_research.archive_catalog import archive_status, evaluate_retention_eligibility
 from pump_research.archive_storage import (
     FilesystemObjectStore,
+    S3CompatibleStorageError,
+    check_s3_compatible_readiness,
     copy_archive,
+    create_s3_compatible_object_store,
     verify_filesystem_copy,
+    verify_object_store_copy,
 )
 from pump_research.backup import backup_status, verify_backup
 from pump_research.candidates.policy import CandidatePolicy
@@ -37,7 +46,7 @@ from pump_research.collection.recovery import reconcile_stale_collector_run
 from pump_research.collection.runtime import CollectorRuntime
 from pump_research.collection.security import TokenSecurityWorkflow
 from pump_research.collection.worker import CollectorWorker
-from pump_research.config import get_settings
+from pump_research.config import ArchiveS3ConfigurationError, get_settings
 from pump_research.database import check_database_health, create_database_engine
 from pump_research.database_safety import inspect_engine_database_safety
 from pump_research.discovery.pumpportal import PumpPortalDiscoverySource
@@ -142,6 +151,17 @@ def build_parser() -> argparse.ArgumentParser:
     archive_copy.add_argument("--role", choices=("primary", "secondary"), required=True)
     archive_copy.add_argument("--independent-copy", action="store_true")
     archive_copy.add_argument("--independence-detail")
+    archive_copy_s3 = archive_commands.add_parser(
+        "copy-s3", help="Copy and fully read-verify an archive on configured S3-compatible storage"
+    )
+    archive_copy_s3.add_argument("manifest", type=Path)
+    archive_copy_s3.add_argument("--role", choices=("primary", "secondary"), required=True)
+    archive_copy_s3.add_argument(
+        "--independent-copy",
+        action="store_true",
+        help="Explicitly assert a physically independent provider/device failure domain",
+    )
+    archive_copy_s3.add_argument("--independence-detail")
     archive_verify_copy = archive_commands.add_parser(
         "verify-copy", help="Re-read and verify an existing filesystem archive copy"
     )
@@ -150,6 +170,23 @@ def build_parser() -> argparse.ArgumentParser:
     archive_verify_copy.add_argument("--role", choices=("primary", "secondary"), required=True)
     archive_verify_copy.add_argument("--independent-copy", action="store_true")
     archive_verify_copy.add_argument("--independence-detail")
+    archive_verify_s3_copy = archive_commands.add_parser(
+        "verify-s3-copy", help="Fully read back an existing configured S3-compatible copy"
+    )
+    archive_verify_s3_copy.add_argument("manifest", type=Path)
+    archive_verify_s3_copy.add_argument(
+        "--role", choices=("primary", "secondary"), required=True
+    )
+    archive_verify_s3_copy.add_argument(
+        "--independent-copy",
+        action="store_true",
+        help="Explicitly assert a physically independent provider/device failure domain",
+    )
+    archive_verify_s3_copy.add_argument("--independence-detail")
+    archive_commands.add_parser(
+        "s3-readiness",
+        help="Upload, HEAD, and fully read a deterministic non-deleted readiness object",
+    )
     archive_benchmark = archive_commands.add_parser(
         "benchmark", help="Read-only core-observation Parquet benchmark"
     )
@@ -492,9 +529,29 @@ async def run_archive_command(
     """Export, verify, measure, or query immutable Parquet artifacts."""
     settings = get_settings()
     configure_logging(settings)
+    result: object
+    if command == "s3-readiness":
+        try:
+            store = create_s3_compatible_object_store(settings)
+            result = await check_s3_compatible_readiness(store)
+            exit_code = 0
+        except (
+            ArchiveConflictError,
+            ArchiveS3ConfigurationError,
+            S3CompatibleStorageError,
+        ) as error:
+            result = {
+                "status": "FAIL",
+                "provider_kind": "s3_compatible",
+                "reason": str(error),
+                "delete_attempted": False,
+            }
+            exit_code = 1
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+        return exit_code
     if command == "verify":
         assert manifest is not None
-        result: object = await verify_archive(manifest)
+        result = await verify_archive(manifest)
     elif command == "stats":
         assert manifest is not None
         result = archive_stats(manifest)
@@ -529,6 +586,32 @@ async def run_archive_command(
                     session_factory,
                     source_manifest=manifest,
                     destination=output,
+                    copy_role=copy_role,
+                    independence_asserted=independent_copy,
+                    independence_detail=independence_detail,
+                )
+        finally:
+            await engine.dispose()
+    elif command in {"copy-s3", "verify-s3-copy"}:
+        assert manifest is not None and copy_role is not None
+        store = create_s3_compatible_object_store(settings)
+        engine = create_database_engine(settings)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            if command == "copy-s3":
+                result = await copy_archive(
+                    session_factory,
+                    manifest_path=manifest,
+                    store=store,
+                    copy_role=copy_role,
+                    independence_asserted=independent_copy,
+                    independence_detail=independence_detail,
+                )
+            else:
+                result = await verify_object_store_copy(
+                    session_factory,
+                    source_manifest=manifest,
+                    store=store,
                     copy_role=copy_role,
                     independence_asserted=independent_copy,
                     independence_detail=independence_detail,

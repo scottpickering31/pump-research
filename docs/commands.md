@@ -158,3 +158,50 @@ make db-down
 
 Configuration comes from `.env`. Never place real credentials in
 `.env.example` or commit `.env`.
+
+## S3-compatible archive copies
+
+Configure all six provider-neutral settings before using object storage:
+
+```text
+PUMP_RESEARCH_ARCHIVE_S3_ENDPOINT_URL
+PUMP_RESEARCH_ARCHIVE_S3_BUCKET
+PUMP_RESEARCH_ARCHIVE_S3_PREFIX
+PUMP_RESEARCH_ARCHIVE_S3_ACCESS_KEY_ID
+PUMP_RESEARCH_ARCHIVE_S3_SECRET_ACCESS_KEY
+PUMP_RESEARCH_ARCHIVE_S3_REGION
+```
+
+The endpoint must be HTTPS and cannot contain user information, a path, query
+data, or a fragment. Credentials are passed explicitly to a SigV4 Boto3 client; the SDK
+cannot fall back to ambient credentials. The access key ID and secret key are
+secret settings and are excluded from configuration snapshots and output.
+
+Run the non-destructive readiness probe first. It uploads a small deterministic
+object below `_readiness/pump-research/archive-storage/v1/`, checks its length,
+fully reads it back, and verifies SHA-256. It prints `PASS` or `FAIL`. The probe
+is intentionally retained because the archive writer has no delete operation;
+repeated runs reuse the same content-addressed key.
+
+```bash
+python -m pump_research archive s3-readiness
+```
+
+Copy an already verified canonical archive, publishing the manifest last, then
+independently re-read an existing copy:
+
+```bash
+python -m pump_research archive copy-s3 /path/to/manifest.json \
+  --role secondary \
+  --independent-copy \
+  --independence-detail 'separate storage provider and physical failure domain'
+
+python -m pump_research archive verify-s3-copy /path/to/manifest.json \
+  --role secondary \
+  --independent-copy \
+  --independence-detail 'separate storage provider and physical failure domain'
+```
+
+The assertion is mandatory for a secondary copy. Every object is checked by
+content length and full SHA-256 readback before the catalog records it. These
+commands provide no delete action.

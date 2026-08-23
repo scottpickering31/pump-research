@@ -39,6 +39,9 @@ def configure_logging(settings: Settings) -> None:
     # DEBUG. Provider credentials may legitimately live in an RPC URL query.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # SDK DEBUG traces can contain signed request headers and access-key IDs.
+    for logger_name in ("boto3", "botocore", "s3transfer", "urllib3"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
     renderer: structlog.types.Processor
     if settings.log_json:
