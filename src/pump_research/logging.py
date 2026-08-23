@@ -35,6 +35,10 @@ def configure_logging(settings: Settings) -> None:
     """Configure structured logs for a command-line process."""
     log_level = logging.getLevelNamesMapping()[settings.log_level]
     logging.basicConfig(format="%(message)s", level=log_level, stream=sys.stdout)
+    # HTTPX logs complete request URLs at INFO and httpcore exposes wire details at
+    # DEBUG. Provider credentials may legitimately live in an RPC URL query.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     renderer: structlog.types.Processor
     if settings.log_json:

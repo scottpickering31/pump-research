@@ -78,8 +78,8 @@ class SolanaRpcClient:
         http_client: httpx.AsyncClient | None = None,
         rate_limiter: AsyncRateLimiter | None = None,
     ) -> None:
+        self._rpc_url = settings.solana_rpc_url
         self._http_client = http_client or httpx.AsyncClient(
-            base_url=settings.solana_rpc_url,
             timeout=httpx.Timeout(settings.solana_rpc_timeout_seconds),
         )
         self._owns_http_client = http_client is None
@@ -103,23 +103,12 @@ class SolanaRpcClient:
             raise ValueError("getMultipleAccounts requires between 1 and 100 addresses")
         if len(set(addresses)) != len(addresses) or any(not item.strip() for item in addresses):
             raise ValueError("getMultipleAccounts addresses must be unique and non-empty")
-        await self._rate_limiter.acquire()
-        request_payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getMultipleAccounts",
-            "params": [addresses, {"encoding": "base64", "commitment": "finalized"}],
-        }
-        try:
-            response = await self._http_client.post("", json=request_payload)
-            response.raise_for_status()
-            payload = response.json()
-        except (httpx.HTTPError, ValueError) as error:
-            raise SolanaRpcError("Solana getMultipleAccounts request failed") from error
+        payload = await self._rpc(
+            "getMultipleAccounts",
+            [addresses, {"encoding": "base64", "commitment": "finalized"}],
+        )
         if not isinstance(payload, dict):
             raise SolanaRpcError("Solana JSON-RPC response must be an object")
-        if payload.get("error") is not None:
-            raise SolanaRpcError(f"Solana JSON-RPC error: {payload['error']!r}")
         result = payload.get("result")
         if not isinstance(result, dict):
             raise SolanaRpcError("Solana JSON-RPC result is missing")
@@ -232,14 +221,18 @@ class SolanaRpcClient:
         await self._rate_limiter.acquire()
         try:
             response = await self._http_client.post(
-                "", json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+                self._rpc_url,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
             )
             response.raise_for_status()
             payload = response.json()
-        except (httpx.HTTPError, ValueError) as error:
-            raise SolanaRpcError(f"Solana {method} request failed") from error
+        except (httpx.HTTPError, ValueError):
+            # HTTPX exceptions can render the full request URL. Suppress their
+            # context so query-bearing RPC credentials cannot enter application logs.
+            raise SolanaRpcError(f"Solana {method} request failed") from None
         if not isinstance(payload, dict):
             raise SolanaRpcError(f"Solana {method} response must be an object")
         if payload.get("error") is not None:
-            raise SolanaRpcError(f"Solana {method} JSON-RPC error: {payload['error']!r}")
+            # Provider error details are untrusted and may echo request credentials.
+            raise SolanaRpcError(f"Solana {method} JSON-RPC error")
         return payload
