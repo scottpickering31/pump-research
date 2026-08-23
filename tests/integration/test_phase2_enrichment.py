@@ -24,6 +24,8 @@ from pump_research.market_data.solana_rpc import (
 from pump_research.persistence.enrichment import (
     BoostCreate,
     BoostRepository,
+    EnrichmentIdentityConflictError,
+    MarketContextRepository,
     MetadataCreate,
     TokenMetadataRepository,
     TokenSecurityTaskRepository,
@@ -45,6 +47,31 @@ from pump_research.persistence.repositories import (
 )
 
 NOW = datetime(2026, 8, 21, 12, tzinfo=UTC)
+
+
+def _market_context_values(run_id: uuid.UUID) -> dict[str, object]:
+    return {
+        "collection_epoch_id": uuid.UUID(int=0),
+        "collector_run_id": run_id,
+        "bucket_start": NOW - timedelta(minutes=5),
+        "bucket_end": NOW,
+        "source_observed_at": NOW,
+        "received_at": NOW,
+        "sol_usd_price": Decimal("123.4567890123456789012"),
+        "sol_return_5m": Decimal("0.1234567890124"),
+        "sol_realized_volatility_1h": Decimal("0.00000000000049"),
+        "admitted_tokens": 87,
+        "active_transitions": 11,
+        "mature_cohort_tokens": 29,
+        "mature_cohort_active_tokens": 7,
+        "mature_cohort_active_fraction": Decimal(7) / Decimal(29),
+        "pair_sample_count": 87,
+        "aggregate_volume_m5_usd": Decimal("123456.1234564"),
+        "aggregate_buys_m5": 321,
+        "aggregate_sells_m5": 123,
+        "policy_sha256": "f" * 64,
+        "policy_snapshot": {"component": "market_context", "schema_version": 1},
+    }
 
 
 async def _subject(
@@ -400,6 +427,122 @@ async def test_security_schedule_is_finite_restart_safe_and_does_not_duplicate(
     assert task is not None
     assert task.phase == 1
     assert task.next_due_at == NOW + timedelta(hours=1)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_market_context_postgres_numeric_rounding_is_restart_idempotent(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    run_id, _, _ = await _subject(session_factory)
+    repository = MarketContextRepository()
+    values = _market_context_values(run_id)
+
+    async with session_factory() as session, session.begin():
+        first = await repository.record(session, **values)
+
+    assert first.sol_usd_price == Decimal("123.456789012345678901")
+    assert first.sol_return_5m == Decimal("0.123456789012")
+    assert first.sol_realized_volatility_1h == Decimal("0.000000000000")
+    assert first.mature_cohort_active_fraction == Decimal("0.241379310345")
+    assert first.aggregate_volume_m5_usd == Decimal("123456.123456")
+
+    async with session_factory() as session, session.begin():
+        restarted = await repository.record(session, **values)
+
+    async with session_factory() as session:
+        count = await session.scalar(select(func.count()).select_from(MarketContextSnapshot))
+    assert restarted.id == first.id
+    assert count == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_market_context_rejects_genuinely_different_numeric_content(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    run_id, _, _ = await _subject(session_factory)
+    repository = MarketContextRepository()
+    values = _market_context_values(run_id)
+    async with session_factory() as session, session.begin():
+        await repository.record(session, **values)
+
+    changed = {**values, "sol_return_5m": Decimal("0.123456789014")}
+    with pytest.raises(
+        EnrichmentIdentityConflictError,
+        match=(
+            r"^market context bucket identity maps to different content: sol_return_5m$"
+        ),
+    ):
+        async with session_factory() as session, session.begin():
+            await repository.record(session, **changed)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("admitted_tokens", 88),
+        (
+            "policy_snapshot",
+            {"component": "market_context", "schema_version": 1, "bucket_seconds": 60},
+        ),
+    ],
+)
+async def test_market_context_rejects_genuinely_different_integer_or_content_fields(
+    session_factory: async_sessionmaker[AsyncSession],
+    field: str,
+    changed_value: object,
+) -> None:
+    run_id, _, _ = await _subject(session_factory)
+    repository = MarketContextRepository()
+    values = _market_context_values(run_id)
+    async with session_factory() as session, session.begin():
+        await repository.record(session, **values)
+
+    changed = {**values, field: changed_value}
+    with pytest.raises(
+        EnrichmentIdentityConflictError,
+        match=rf"^market context bucket identity maps to different content: {field}$",
+    ):
+        async with session_factory() as session, session.begin():
+            await repository.record(session, **changed)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_market_context_bucket_and_policy_define_distinct_identities(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    run_id, _, _ = await _subject(session_factory)
+    repository = MarketContextRepository()
+    values = _market_context_values(run_id)
+    next_bucket = {
+        **values,
+        "bucket_start": NOW,
+        "bucket_end": NOW + timedelta(minutes=5),
+        "source_observed_at": NOW + timedelta(minutes=5),
+        "received_at": NOW + timedelta(minutes=5),
+    }
+    changed_policy = {
+        **values,
+        "policy_sha256": "e" * 64,
+        "policy_snapshot": {
+            "component": "market_context",
+            "schema_version": 2,
+        },
+    }
+
+    async with session_factory() as session, session.begin():
+        original = await repository.record(session, **values)
+        later = await repository.record(session, **next_bucket)
+        revised = await repository.record(session, **changed_policy)
+
+    async with session_factory() as session:
+        count = await session.scalar(select(func.count()).select_from(MarketContextSnapshot))
+    assert len({original.id, later.id, revised.id}) == 3
+    assert count == 3
 
 
 @pytest.mark.integration

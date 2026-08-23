@@ -7,7 +7,7 @@ import json
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 
 from sqlalchemy import func, nullsfirst, or_, select
 from sqlalchemy.dialects.postgresql import insert
@@ -649,9 +649,15 @@ class MarketContextRepository:
             "policy_sha256",
             "policy_snapshot",
         )
-        if any(getattr(stored, field) != values[field] for field in semantic_fields):
+        mismatches = [
+            field
+            for field in semantic_fields
+            if not _database_value_equal(getattr(stored, field), values[field])
+        ]
+        if mismatches:
             raise EnrichmentIdentityConflictError(
-                "market context bucket identity maps to different content"
+                "market context bucket identity maps to different content: "
+                + ", ".join(mismatches)
             )
         return stored
 
@@ -678,9 +684,32 @@ def _database_value_equal(stored: object, proposed: object) -> bool:
     """Compare values after the harmless coercions PostgreSQL numeric/JSON performs."""
     if isinstance(stored, Decimal) or isinstance(proposed, Decimal):
         try:
-            return Decimal(stored) == Decimal(proposed)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+            stored_decimal = Decimal(stored)  # type: ignore[arg-type]
+            proposed_decimal = Decimal(proposed)  # type: ignore[arg-type]
+        except (InvalidOperation, TypeError, ValueError):
             return False
+        if stored_decimal == proposed_decimal:
+            return True
+        if not stored_decimal.is_finite() or not proposed_decimal.is_finite():
+            return False
+        stored_exponent = stored_decimal.as_tuple().exponent
+        proposed_exponent = proposed_decimal.as_tuple().exponent
+        assert isinstance(stored_exponent, int)
+        assert isinstance(proposed_exponent, int)
+        precision = max(
+            len(stored_decimal.as_tuple().digits) + abs(stored_exponent),
+            len(proposed_decimal.as_tuple().digits) + abs(proposed_exponent),
+        )
+        try:
+            with localcontext() as context:
+                context.prec = max(precision, 1)
+                coerced = proposed_decimal.quantize(
+                    stored_decimal,
+                    rounding=ROUND_HALF_UP,
+                )
+        except InvalidOperation:
+            return False
+        return stored_decimal == coerced
     if isinstance(stored, datetime) and isinstance(proposed, datetime):
         return stored.astimezone(UTC) == proposed.astimezone(UTC)
     return stored == proposed
