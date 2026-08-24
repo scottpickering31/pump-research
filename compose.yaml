@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
+    shm_size: "1gb"
     environment:
       POSTGRES_DB: pump_research
       POSTGRES_USER: pump_research
