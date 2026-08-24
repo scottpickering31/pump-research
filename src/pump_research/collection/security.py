@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from pump_research.config import Settings
@@ -21,10 +22,12 @@ from pump_research.market_data.solana_rpc import (
     SolanaMultipleAccountsResult,
 )
 from pump_research.persistence.enrichment import (
+    SecurityClaim,
     TokenSecuritySnapshotRepository,
     TokenSecurityTaskRepository,
     canonical_digest,
 )
+from pump_research.persistence.models import Token
 from pump_research.persistence.repositories import ApiRequestLogRepository
 
 SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
@@ -139,6 +142,7 @@ class TokenSecurityWorkflow:
         except Exception as error:
             failed_at = datetime.now(UTC)
             async with self._session_factory() as session, session.begin():
+                await self._lock_claimed_tokens(session, claims=claims)
                 await self._requests.record(
                     session,
                     collector_run_id=collector_run_id,
@@ -170,6 +174,7 @@ class TokenSecurityWorkflow:
             "empty" if unavailable == len(decoded) else "partial" if malformed else "succeeded"
         )
         async with self._session_factory() as session, session.begin():
+            await self._lock_claimed_tokens(session, claims=claims)
             request = await self._requests.record(
                 session,
                 collector_run_id=collector_run_id,
@@ -209,6 +214,28 @@ class TokenSecurityWorkflow:
                 )
             await self._tasks.complete(session, claims=claims, checked_at=result.received_at)
         return SecurityCollectionResult(len(claims), available, unavailable, malformed)
+
+    async def _lock_claimed_tokens(
+        self,
+        session: AsyncSession,
+        *,
+        claims: tuple[SecurityClaim, ...],
+    ) -> tuple[uuid.UUID, ...]:
+        """Establish the canonical parent-before-child lock order for persistence."""
+        token_ids = tuple(sorted({claim.token_id for claim in claims}))
+        locked_token_ids = tuple(
+            (
+                await session.scalars(
+                    select(Token.id)
+                    .where(Token.id.in_(token_ids))
+                    .order_by(Token.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        if locked_token_ids != token_ids:
+            raise RuntimeError("claimed token no longer exists")
+        return locked_token_ids
 
 
 def decode_mint_account(account_result: SolanaAccountResult) -> DecodedMint:

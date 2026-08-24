@@ -27,6 +27,7 @@ from pump_research.persistence.enrichment import (
     EnrichmentIdentityConflictError,
     MarketContextRepository,
     MetadataCreate,
+    SecurityClaim,
     TokenMetadataRepository,
     TokenSecurityTaskRepository,
     latest_as_of,
@@ -45,6 +46,8 @@ from pump_research.persistence.repositories import (
     CollectorRunRepository,
     TokenRepository,
 )
+from pump_research.scheduling.policy import LifecycleState
+from pump_research.scheduling.scheduler import AdaptiveScheduler
 
 NOW = datetime(2026, 8, 21, 12, tzinfo=UTC)
 
@@ -399,6 +402,41 @@ class _FakeSolana:
         )
 
 
+class _GatedSolana(_FakeSolana):
+    def __init__(self, *, rpc_started: asyncio.Event, parent_locked: asyncio.Event) -> None:
+        self._rpc_started = rpc_started
+        self._parent_locked = parent_locked
+
+    async def get_multiple_accounts(
+        self, *, addresses: list[str]
+    ) -> SolanaMultipleAccountsResult:
+        self._rpc_started.set()
+        await self._parent_locked.wait()
+        return await super().get_multiple_accounts(addresses=addresses)
+
+
+class _ObservedTokenSecurityWorkflow(TokenSecurityWorkflow):
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        source: _GatedSolana,
+        settings: Settings,
+        *,
+        persistence_lock_attempted: asyncio.Event,
+    ) -> None:
+        super().__init__(session_factory, source, settings)
+        self._persistence_lock_attempted = persistence_lock_attempted
+
+    async def _lock_claimed_tokens(
+        self,
+        session: AsyncSession,
+        *,
+        claims: tuple[SecurityClaim, ...],
+    ) -> tuple[uuid.UUID, ...]:
+        self._persistence_lock_attempted.set()
+        return await super()._lock_claimed_tokens(session, claims=claims)
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_security_schedule_is_finite_restart_safe_and_does_not_duplicate(
@@ -427,6 +465,131 @@ async def test_security_schedule_is_finite_restart_safe_and_does_not_duplicate(
     assert task is not None
     assert task.phase == 1
     assert task.next_due_at == NOW + timedelta(hours=1)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_security_persistence_and_parent_first_promotion_complete_without_deadlock(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    run_id, token_id, _ = await _subject(session_factory)
+    settings = Settings(
+        database_url="postgresql+asyncpg://researcher:password@localhost:5433/pump_research",
+        token_security_lease_seconds=60,
+    )
+    scheduler = AdaptiveScheduler(session_factory, settings)
+    async with session_factory() as session, session.begin():
+        await scheduler.set_lifecycle_state_in_session(
+            session,
+            token_id=token_id,
+            state=LifecycleState.NEW,
+            decided_at=NOW,
+            admitted_at=NOW,
+            reason_code="security_deadlock_regression_setup",
+        )
+        await TokenSecurityTaskRepository().create_if_absent(
+            session, token_id=token_id, due_at=NOW
+        )
+
+    rpc_started = asyncio.Event()
+    parent_locked = asyncio.Event()
+    persistence_lock_attempted = asyncio.Event()
+    workflow = _ObservedTokenSecurityWorkflow(
+        session_factory,
+        _GatedSolana(rpc_started=rpc_started, parent_locked=parent_locked),
+        settings,
+        persistence_lock_attempted=persistence_lock_attempted,
+    )
+
+    async def promotion_style_transaction() -> None:
+        await rpc_started.wait()
+        async with session_factory() as session, session.begin():
+            await scheduler.set_lifecycle_state_in_session(
+                session,
+                token_id=token_id,
+                state=LifecycleState.NEW,
+                decided_at=NOW + timedelta(seconds=1),
+                reason_code="concurrent_security_deadlock_regression",
+            )
+            parent_locked.set()
+            await persistence_lock_attempted.wait()
+            task = await session.scalar(
+                select(TokenSecurityTask)
+                .where(TokenSecurityTask.token_id == token_id)
+                .with_for_update()
+            )
+            assert task is not None
+
+    collection, _ = await asyncio.wait_for(
+        asyncio.gather(
+            workflow.collect_due(collector_run_id=run_id, now=NOW),
+            promotion_style_transaction(),
+        ),
+        timeout=5,
+    )
+
+    assert collection.available == 1
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(TokenSecuritySnapshot)) == 1
+        task = await session.get(TokenSecurityTask, token_id)
+    assert task is not None and task.phase == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_reverse_security_batches_lock_tokens_in_database_uuid_order(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    _, first_token_id, _ = await _subject(session_factory)
+    async with session_factory() as session, session.begin():
+        second_token = await TokenRepository().get_or_create(
+            session,
+            chain="solana",
+            address="phase2-second-security-token",
+            first_discovered_at=NOW,
+        )
+        await TokenSecurityTaskRepository().create_if_absent(
+            session, token_id=first_token_id, due_at=NOW
+        )
+        await TokenSecurityTaskRepository().create_if_absent(
+            session, token_id=second_token.id, due_at=NOW
+        )
+    ordered_token_ids = tuple(sorted((first_token_id, second_token.id)))
+    claims_by_token_id = {
+        token_id: SecurityClaim(token_id, str(token_id), 0, uuid.uuid4())
+        for token_id in ordered_token_ids
+    }
+    forward = tuple(claims_by_token_id[token_id] for token_id in ordered_token_ids)
+    reverse = tuple(reversed(forward))
+    workflow = TokenSecurityWorkflow(
+        session_factory,
+        _FakeSolana(),
+        Settings(
+            database_url="postgresql+asyncpg://researcher:password@localhost:5433/pump_research"
+        ),
+    )
+    start = asyncio.Barrier(2)
+
+    async def lock_batch(claims: tuple[SecurityClaim, ...]) -> tuple[uuid.UUID, ...]:
+        await start.wait()
+        async with session_factory() as session, session.begin():
+            locked = await workflow._lock_claimed_tokens(session, claims=claims)
+            for claim in claims:
+                task = await session.scalar(
+                    select(TokenSecurityTask)
+                    .where(TokenSecurityTask.token_id == claim.token_id)
+                    .with_for_update()
+                )
+                assert task is not None
+            return locked
+
+    locked_orders = await asyncio.wait_for(
+        asyncio.gather(lock_batch(forward), lock_batch(reverse)),
+        timeout=5,
+    )
+
+    assert len(locked_orders) == 2
+    assert all(locked_order == ordered_token_ids for locked_order in locked_orders)
 
 
 @pytest.mark.integration
