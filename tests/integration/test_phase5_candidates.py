@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -24,6 +25,7 @@ from pump_research.persistence.models import (
     CandidateEvent,
     CandidateTierEvent,
     FundingRelationshipEvidence,
+    HolderBalanceFact,
     HolderSnapshot,
     PollSchedule,
     SecurityFeatureSnapshot,
@@ -45,6 +47,7 @@ from pump_research.research.asof import get_token_state_as_of
 from pump_research.research.sources import DuckDBArchiveResearchSource, PostgresResearchSource
 from pump_research.scheduling.policy import LifecycleState
 from pump_research.scheduling.scheduler import AdaptiveScheduler
+from pump_research.security_enrichment.analysis import build_holder_metrics
 from pump_research.security_enrichment.contracts import (
     AcquisitionMode,
     CreatorEvidencePage,
@@ -66,6 +69,10 @@ from pump_research.security_enrichment.contracts import (
 )
 from pump_research.security_enrichment.policy import SecurityEnrichmentPolicy
 from pump_research.security_enrichment.provider import SecurityProviderError
+from pump_research.security_enrichment.repository import (
+    SecurityEnrichmentRepository,
+    SecurityEvidenceIntegrityError,
+)
 from pump_research.security_enrichment.service import SecurityEnrichmentWorker
 
 NOW = datetime(2026, 8, 21, 12, tzinfo=UTC)
@@ -794,6 +801,232 @@ async def test_four_phase6_workers_claim_once_persist_as_of_and_promote_tier3(
 class _FailingPhase6Provider(_Phase6Provider):
     async def fetch_holders(self, request: ProviderPageRequest) -> HolderEvidencePage:
         raise SecurityProviderError("fixture timeout")
+
+
+class _ProductionScaleHolderProvider(_Phase6Provider):
+    async def fetch_holders(self, request: ProviderPageRequest) -> HolderEvidencePage:
+        return HolderEvidencePage(
+            envelope=self._envelope(),
+            mint_supply_raw=Decimal("999931476057174"),
+            holder_count=None,
+            accounts=(
+                HolderAccountFact("production-account-a", "wallet-a", Decimal("333333333333333")),
+                HolderAccountFact("production-account-b", "wallet-b", Decimal("100000000000000")),
+            ),
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_production_holder_numeric_readback_is_idempotent(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service, _, run_id, _ = await _tier2_subject(session_factory)
+    claim = (
+        await service.claim_tasks(
+            now=NOW + timedelta(seconds=1),
+            worker_id="production-numeric-worker",
+            collector_run_id=run_id,
+            limit=1,
+            analysis_types=("HOLDER_SNAPSHOT",),
+        )
+    )[0]
+    worker = SecurityEnrichmentWorker(
+        session_factory,
+        service,
+        _ProductionScaleHolderProvider(),
+        SecurityEnrichmentPolicy.from_settings(_settings()),
+    )
+
+    await worker.process_claim(claim, now=NOW + timedelta(seconds=1))
+    await worker.process_claim(claim, now=NOW + timedelta(seconds=1))
+
+    async with session_factory() as session:
+        snapshot = await session.scalar(select(HolderSnapshot))
+        snapshot_count = await session.scalar(select(func.count()).select_from(HolderSnapshot))
+        fact_count = await session.scalar(select(func.count()).select_from(HolderBalanceFact))
+        request_count = await session.scalar(
+            select(func.count())
+            .select_from(SecurityProviderRequest)
+            .where(SecurityProviderRequest.method == "HOLDER_SNAPSHOT")
+        )
+    assert snapshot is not None
+    assert snapshot.top_1_pct == Decimal("33.335617621289")
+    assert snapshot.top_5_pct == Decimal("43.336302907676")
+    assert snapshot.top_10_pct == Decimal("43.336302907676")
+    assert snapshot.top_20_pct == Decimal("43.336302907676")
+    assert snapshot.largest_holder_pct == Decimal("33.335617621289")
+    assert snapshot.largest_non_pool_holder_pct == Decimal("33.335617621289")
+    assert snapshot.covered_supply_pct == Decimal("43.336302907676")
+    assert snapshot_count == 1
+    assert fact_count == 2
+    assert request_count == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_holder_snapshot_rejects_genuine_top_1_conflict(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service, _, run_id, _ = await _tier2_subject(session_factory)
+    claim = (
+        await service.claim_tasks(
+            now=NOW + timedelta(seconds=1),
+            worker_id="genuine-conflict-worker",
+            collector_run_id=run_id,
+            limit=1,
+            analysis_types=("HOLDER_SNAPSHOT",),
+        )
+    )[0]
+    provider = _ProductionScaleHolderProvider()
+    policy = SecurityEnrichmentPolicy.from_settings(_settings())
+    worker = SecurityEnrichmentWorker(session_factory, service, provider, policy)
+    await worker.process_claim(claim, now=NOW + timedelta(seconds=1))
+    page = await provider.fetch_holders(
+        ProviderPageRequest(
+            token_address="phase5-token",
+            candidate_id=str(claim.candidate_id),
+            input_watermark=claim.input_watermark,
+            cursor=None,
+            limit=20,
+        )
+    )
+    metrics = build_holder_metrics(
+        page.accounts,
+        mint_supply_raw=page.mint_supply_raw,
+        holder_count=page.holder_count,
+        completeness=page.envelope.completeness,
+    )
+    assert metrics.top_1_pct is not None
+    repository = SecurityEnrichmentRepository()
+
+    with pytest.raises(
+        SecurityEvidenceIntegrityError,
+        match="security evidence identity maps to different top_1_pct",
+    ):
+        async with session_factory() as session, session.begin():
+            context = await repository.load_context(session, claim)
+            request = await session.scalar(
+                select(SecurityProviderRequest).where(
+                    SecurityProviderRequest.method == "HOLDER_SNAPSHOT"
+                )
+            )
+            assert request is not None
+            await repository.record_holder_snapshot(
+                session,
+                context=context,
+                request=request,
+                envelope=page.envelope,
+                accounts=page.accounts,
+                metrics=replace(metrics, top_1_pct=metrics.top_1_pct + Decimal("1")),
+                mint_supply_raw=page.mint_supply_raw,
+                page_count=1,
+                policy=policy,
+            )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_holder_supply_is_part_of_evidence_identity(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service, _, run_id, _ = await _tier2_subject(session_factory)
+    claim = (
+        await service.claim_tasks(
+            now=NOW + timedelta(seconds=1),
+            worker_id="holder-supply-identity-worker",
+            collector_run_id=run_id,
+            limit=1,
+            analysis_types=("HOLDER_SNAPSHOT",),
+        )
+    )[0]
+    provider = _ProductionScaleHolderProvider()
+    policy = SecurityEnrichmentPolicy.from_settings(_settings())
+    worker = SecurityEnrichmentWorker(session_factory, service, provider, policy)
+    await worker.process_claim(claim, now=NOW + timedelta(seconds=1))
+    page = await provider.fetch_holders(
+        ProviderPageRequest(
+            token_address="phase5-token",
+            candidate_id=str(claim.candidate_id),
+            input_watermark=claim.input_watermark,
+            cursor=None,
+            limit=20,
+        )
+    )
+    assert page.mint_supply_raw is not None
+    changed_supply = page.mint_supply_raw + Decimal("1")
+    changed_metrics = build_holder_metrics(
+        page.accounts,
+        mint_supply_raw=changed_supply,
+        holder_count=page.holder_count,
+        completeness=page.envelope.completeness,
+    )
+    repository = SecurityEnrichmentRepository()
+    async with session_factory() as session, session.begin():
+        context = await repository.load_context(session, claim)
+        request = await session.scalar(
+            select(SecurityProviderRequest).where(
+                SecurityProviderRequest.method == "HOLDER_SNAPSHOT"
+            )
+        )
+        assert request is not None
+        changed = await repository.record_holder_snapshot(
+            session,
+            context=context,
+            request=request,
+            envelope=page.envelope,
+            accounts=page.accounts,
+            metrics=changed_metrics,
+            mint_supply_raw=changed_supply,
+            page_count=1,
+            policy=policy,
+        )
+
+    async with session_factory() as session:
+        snapshots = list((await session.scalars(select(HolderSnapshot))).all())
+    assert len(snapshots) == 2
+    other_keys = {item.semantic_key for item in snapshots if item.id != changed.id}
+    assert changed.semantic_key not in other_keys
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_exact_holder_retry_is_idempotent(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service, _, run_id, _ = await _tier2_subject(session_factory)
+    claim = (
+        await service.claim_tasks(
+            now=NOW + timedelta(seconds=1),
+            worker_id="concurrent-holder-worker",
+            collector_run_id=run_id,
+            limit=1,
+            analysis_types=("HOLDER_SNAPSHOT",),
+        )
+    )[0]
+    worker = SecurityEnrichmentWorker(
+        session_factory,
+        service,
+        _ProductionScaleHolderProvider(),
+        SecurityEnrichmentPolicy.from_settings(_settings()),
+    )
+
+    await asyncio.gather(
+        worker.process_claim(claim, now=NOW + timedelta(seconds=1)),
+        worker.process_claim(claim, now=NOW + timedelta(seconds=1)),
+    )
+
+    async with session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(HolderSnapshot)) == 1
+        assert await session.scalar(select(func.count()).select_from(HolderBalanceFact)) == 2
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(SecurityProviderRequest)
+                .where(SecurityProviderRequest.method == "HOLDER_SNAPSHOT")
+            )
+            == 1
+        )
 
 
 @pytest.mark.integration

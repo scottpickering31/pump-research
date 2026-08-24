@@ -7,9 +7,10 @@ import json
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal, localcontext
+from typing import Any, cast
 
-from sqlalchemy import func, select, text
+from sqlalchemy import Numeric, func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -285,6 +286,7 @@ class SecurityEnrichmentRepository:
             {
                 "request": str(request.id),
                 "accounts": [_jsonable(asdict(item)) for item in accounts],
+                "mint_supply_raw": mint_supply_raw,
             }
         )
         semantic = _digest(
@@ -746,6 +748,7 @@ async def _insert_verified[T](
     semantic_field: str | None = None,
     identity_field: str | None = None,
 ) -> T:
+    values = _canonical_model_values(model, values)
     await session.execute(insert(model).values(**values).on_conflict_do_nothing())
     lookup_field = semantic_field or identity_field
     if lookup_field is None:
@@ -761,6 +764,27 @@ async def _insert_verified[T](
                 f"security evidence identity maps to different {field}"
             )
     return row
+
+
+def _canonical_model_values[T](model: type[T], values: dict[str, object]) -> dict[str, object]:
+    """Match fixed-scale NUMERIC values to PostgreSQL's immutable representation."""
+    canonical = dict(values)
+    table = cast(Any, model).__table__
+    for field, value in values.items():
+        column_type = table.columns[field].type
+        if not isinstance(value, Decimal) or not isinstance(column_type, Numeric):
+            continue
+        scale = column_type.scale
+        if scale is None:
+            continue
+        quantum = Decimal(1).scaleb(-scale)
+        with localcontext() as context:
+            context.prec = max(
+                len(value.as_tuple().digits) + abs(scale) + 1,
+                column_type.precision or 0,
+            )
+            canonical[field] = value.quantize(quantum, rounding=ROUND_HALF_UP)
+    return canonical
 
 
 def _digest(value: object) -> str:
