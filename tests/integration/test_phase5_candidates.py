@@ -8,7 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from pump_research.archival import export_epoch_range, verify_archive
@@ -45,6 +45,7 @@ from pump_research.persistence.repositories import (
 )
 from pump_research.research.asof import get_token_state_as_of
 from pump_research.research.sources import DuckDBArchiveResearchSource, PostgresResearchSource
+from pump_research.scheduling.locks import lock_schedule_token_fk_path
 from pump_research.scheduling.policy import CoverageClass, LifecycleState
 from pump_research.scheduling.scheduler import AdaptiveScheduler
 from pump_research.security_enrichment.analysis import build_holder_metrics
@@ -76,6 +77,14 @@ from pump_research.security_enrichment.repository import (
 from pump_research.security_enrichment.service import SecurityEnrichmentWorker
 
 NOW = datetime(2026, 8, 21, 12, tzinfo=UTC)
+
+
+class _FixedClock:
+    def __init__(self, current: datetime) -> None:
+        self.current = current
+
+    def now(self) -> datetime:
+        return self.current
 
 
 def _settings() -> Settings:
@@ -147,6 +156,37 @@ def _evidence(token_id: uuid.UUID, at: datetime = NOW, **changes: object) -> Can
     }
     values.update(changes)
     return CandidateEvidence(**values)  # type: ignore[arg-type]
+
+
+async def _schedule_gate_lock_count(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> int:
+    async with session_factory() as session:
+        return int(
+            await session.scalar(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM pg_locks
+                    WHERE locktype = 'advisory'
+                      AND database = (
+                          SELECT oid FROM pg_database WHERE datname = current_database()
+                      )
+                      AND classid = 1
+                      AND objid = 3133933867
+                      AND objsubid = 1
+                    """
+                )
+            )
+            or 0
+        )
+
+
+async def _acquire_schedule_gate(
+    session_factory: async_sessionmaker[AsyncSession], *, exclusive: bool
+) -> None:
+    async with session_factory() as session, session.begin():
+        await lock_schedule_token_fk_path(session, exclusive=exclusive)
 
 
 @pytest.mark.integration
@@ -408,6 +448,171 @@ async def test_expired_candidate_demotes_without_changing_lifecycle(
     assert schedule is not None and schedule.lifecycle_state == "NEW"
     assert schedule.candidate_coverage_expires_at is None
     assert transitions == 2
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_candidate_demotion_refresh_marker_is_consumed_and_releases_schedule_gate(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service, epoch_id, run_id, token_id = await _subject(session_factory)
+    settings = _settings()
+    fading_at = NOW
+    demoted_at = NOW + timedelta(minutes=31)
+    natural_transition_at = fading_at + timedelta(
+        seconds=settings.scheduler_fading_tail_total_duration_seconds
+    )
+    scheduler = AdaptiveScheduler(session_factory, settings, clock=_FixedClock(demoted_at))
+    await scheduler.set_lifecycle_state(
+        token_id=token_id,
+        state=LifecycleState.FADING,
+        decided_at=fading_at,
+        reason_code="candidate_demotion_marker_regression",
+        collector_run_id=run_id,
+    )
+    await service.evaluate(
+        collection_epoch_id=epoch_id,
+        collector_run_id=run_id,
+        evidence=_evidence(
+            token_id,
+            lifecycle_state=LifecycleState.FADING.value,
+            coverage_class=CoverageClass.FADING_TAIL.value,
+        ),
+    )
+    async with session_factory() as session, session.begin():
+        schedule = await session.scalar(
+            select(PollSchedule).where(PollSchedule.token_id == token_id).with_for_update()
+        )
+        assert schedule is not None
+        await scheduler._refresh_one_coverage(
+            session,
+            schedule=schedule,
+            now=demoted_at,
+            reason_code="candidate_demotion_marker_regression",
+            collector_run_id=run_id,
+        )
+
+    result = await service.evaluate(
+        collection_epoch_id=epoch_id,
+        collector_run_id=run_id,
+        evidence=_evidence(
+            token_id,
+            demoted_at,
+            lifecycle_state=LifecycleState.FADING.value,
+            coverage_class=CoverageClass.FADING_COOL.value,
+            liquidity_usd=Decimal("100"),
+            volume_m5_usd=Decimal("0"),
+            buys_m5=0,
+            sells_m5=0,
+        ),
+    )
+    assert result.current_tier is CandidateTier.TIER_0_UNIVERSAL
+    async with session_factory() as session:
+        poisoned = await session.get(PollSchedule, token_id)
+    assert poisoned is not None
+    assert poisoned.coverage_class == CoverageClass.FADING_COOL.value
+    assert poisoned.candidate_coverage_expires_at is None
+    assert poisoned.candidate_coverage_interval_seconds is None
+    assert poisoned.candidate_tier_event_id is None
+    assert poisoned.coverage_next_transition_at == demoted_at
+
+    claim = await asyncio.wait_for(
+        scheduler.claim_next_batch(collector_run_id=run_id), timeout=2
+    )
+    assert claim is not None
+    async with session_factory() as session:
+        refreshed = await session.get(PollSchedule, token_id)
+    assert refreshed is not None
+    assert refreshed.coverage_class == CoverageClass.FADING_COOL.value
+    assert refreshed.coverage_next_transition_at == natural_transition_at
+    assert await _schedule_gate_lock_count(session_factory) == 0
+    await asyncio.wait_for(_acquire_schedule_gate(session_factory, exclusive=False), timeout=2)
+    await asyncio.wait_for(_acquire_schedule_gate(session_factory, exclusive=True), timeout=2)
+    assert await _schedule_gate_lock_count(session_factory) == 0
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_expired_overlay_budget_rejection_marker_is_consumed(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    _, epoch_id, run_id, first_token_id = await _subject(session_factory)
+    settings = _settings().model_copy(update={"candidate_max_active_coverage": 1})
+    scheduler = AdaptiveScheduler(session_factory, settings, clock=_FixedClock(NOW))
+    async with session_factory() as session, session.begin():
+        second = await TokenRepository().get_or_create(
+            session,
+            chain="solana",
+            address="expired-overlay-budget-holder",
+            first_discovered_at=NOW,
+        )
+        second_token_id = second.id
+    for token_id in (first_token_id, second_token_id):
+        await scheduler.set_lifecycle_state(
+            token_id=token_id,
+            state=LifecycleState.ACTIVE,
+            decided_at=NOW,
+            admitted_at=NOW,
+            reason_code="expired_overlay_budget_regression",
+            collector_run_id=run_id,
+        )
+    service = CandidateOrchestrationService(
+        session_factory,
+        CandidatePolicy.from_settings(settings),
+        task_lease=timedelta(minutes=5),
+        task_max_attempts=4,
+    )
+    await service.evaluate(
+        collection_epoch_id=epoch_id,
+        collector_run_id=run_id,
+        evidence=_evidence(
+            first_token_id,
+            lifecycle_state=LifecycleState.ACTIVE.value,
+            coverage_class=CoverageClass.PROTECTED_ACTIVE.value,
+        ),
+    )
+    later = NOW + timedelta(minutes=31)
+    await service.evaluate(
+        collection_epoch_id=epoch_id,
+        collector_run_id=run_id,
+        evidence=_evidence(
+            second_token_id,
+            later,
+            observation_id="10000000-0000-0000-0000-000000000002",
+            lifecycle_state=LifecycleState.ACTIVE.value,
+            coverage_class=CoverageClass.PROTECTED_ACTIVE.value,
+        ),
+    )
+    refreshed = await service.evaluate(
+        collection_epoch_id=epoch_id,
+        collector_run_id=run_id,
+        evidence=_evidence(
+            first_token_id,
+            later,
+            observation_id="10000000-0000-0000-0000-000000000003",
+            lifecycle_state=LifecycleState.ACTIVE.value,
+            coverage_class=CoverageClass.PROTECTED_ACTIVE.value,
+            volume_m5_usd=Decimal("2100"),
+        ),
+    )
+    assert refreshed.changed
+    assert refreshed.current_tier is CandidateTier.TIER_1_INTERESTING
+    async with session_factory() as session:
+        schedule = await session.get(PollSchedule, first_token_id)
+    assert schedule is not None
+    assert schedule.coverage_class == CoverageClass.PROTECTED_ACTIVE.value
+    assert schedule.candidate_coverage_expires_at is None
+    assert schedule.candidate_coverage_interval_seconds is None
+    assert schedule.candidate_tier_event_id is None
+    assert schedule.coverage_next_transition_at == later
+
+    scheduler = AdaptiveScheduler(session_factory, settings, clock=_FixedClock(later))
+    assert await asyncio.wait_for(scheduler.claim_next_batch(collector_run_id=run_id), timeout=2)
+    async with session_factory() as session:
+        schedule = await session.get(PollSchedule, first_token_id)
+    assert schedule is not None
+    assert schedule.coverage_class == CoverageClass.PROTECTED_ACTIVE.value
+    assert schedule.coverage_next_transition_at is None
 
 
 @pytest.mark.integration

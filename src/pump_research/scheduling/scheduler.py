@@ -69,6 +69,10 @@ class CoverageReconstructionError(RuntimeError):
     """A legacy schedule cannot be mapped without guessing its admission fact."""
 
 
+class CoverageTransitionProgressError(RuntimeError):
+    """A due coverage transition remained due after its transactional refresh."""
+
+
 @dataclass(frozen=True, slots=True)
 class PollMemberClaim:
     """One due token included in a bounded poll batch."""
@@ -1112,6 +1116,22 @@ class AdaptiveScheduler:
                 )
             advanced += len(schedules)
             await session.flush()
+            stalled = list(
+                await session.scalars(
+                    select(PollSchedule.token_id)
+                    .where(
+                        PollSchedule.token_id.in_([schedule.token_id for schedule in schedules]),
+                        PollSchedule.coverage_next_transition_at.is_not(None),
+                        PollSchedule.coverage_next_transition_at <= now,
+                    )
+                    .order_by(PollSchedule.token_id)
+                )
+            )
+            if stalled:
+                raise CoverageTransitionProgressError(
+                    "coverage refresh made no progress for due schedules: "
+                    + ", ".join(str(token_id) for token_id in stalled[:10])
+                )
         if advanced:
             self._cached_capacity_bucket = None
             self._cached_capacity_decision = None
@@ -1138,6 +1158,12 @@ class AdaptiveScheduler:
             state_decided_at=schedule.state_decided_at,
             at=now,
         )
+        baseline_transition_at = self.policy.next_transition_at(
+            state,
+            admitted_at=schedule.admitted_at,
+            state_decided_at=schedule.state_decided_at,
+            at=now,
+        )
         candidate_active = (
             schedule.candidate_coverage_expires_at is not None
             and schedule.candidate_coverage_expires_at > now
@@ -1147,10 +1173,15 @@ class AdaptiveScheduler:
             schedule.candidate_coverage_expires_at is not None
             and schedule.candidate_coverage_expires_at <= now
         )
+        expected_transition_at = _earliest_timestamp(
+            baseline_transition_at,
+            schedule.candidate_coverage_expires_at if candidate_active else None,
+        )
         if (
             schedule.coverage_class == coverage.value
             and schedule.coverage_policy_sha256 == self.policy.coverage_sha256
             and not candidate_expired
+            and schedule.coverage_next_transition_at == expected_transition_at
         ):
             return
         previous = schedule.coverage_class
@@ -1182,12 +1213,6 @@ class AdaptiveScheduler:
                 next_due_at = schedule.next_due_at
         schedule.coverage_class = coverage.value
         schedule.coverage_decided_at = now
-        baseline_transition_at = self.policy.next_transition_at(
-            state,
-            admitted_at=schedule.admitted_at,
-            state_decided_at=schedule.state_decided_at,
-            at=now,
-        )
         schedule.coverage_next_transition_at = _earliest_timestamp(
             baseline_transition_at,
             schedule.candidate_coverage_expires_at if candidate_active else None,

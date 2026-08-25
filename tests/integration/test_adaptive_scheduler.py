@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from pump_research.config import Settings
@@ -31,6 +31,7 @@ from pump_research.scheduling.policy import CoverageClass, LifecycleState
 from pump_research.scheduling.scheduler import (
     AdaptiveScheduler,
     CoverageReconstructionError,
+    CoverageTransitionProgressError,
     LostPollLeaseError,
     PollOutcome,
     SchedulerCapacityDecisionIntegrityError,
@@ -88,6 +89,30 @@ async def _schedule_tokens(
             )
             tokens[address] = token
     return tokens
+
+
+async def _schedule_gate_lock_count(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> int:
+    async with session_factory() as session:
+        return int(
+            await session.scalar(
+                text(
+                    """
+                    SELECT count(*)
+                    FROM pg_locks
+                    WHERE locktype = 'advisory'
+                      AND database = (
+                          SELECT oid FROM pg_database WHERE datname = current_database()
+                      )
+                      AND classid = 1
+                      AND objid = 3133933867
+                      AND objsubid = 1
+                    """
+                )
+            )
+            or 0
+        )
 
 
 @pytest.mark.integration
@@ -650,7 +675,55 @@ async def test_regression_in_flight_batches_are_bounded(
     )
 
     assert await scheduler.claim_next_batch() is not None
+    assert await _schedule_gate_lock_count(session_factory) == 0
     assert await scheduler.claim_next_batch() is None
+    assert await _schedule_gate_lock_count(session_factory) == 0
+
+
+@pytest.mark.integration
+async def test_non_progressing_coverage_refresh_rolls_back_and_releases_schedule_gate(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    clock = FakeClock()
+    scheduler = AdaptiveScheduler(session_factory, _settings(), clock=clock)
+    tokens = await _schedule_tokens(
+        session_factory,
+        scheduler,
+        [("non-progressing-coverage", "solana", LifecycleState.NEW, clock.now())],
+    )
+    token_id = tokens["non-progressing-coverage"].id  # type: ignore[attr-defined]
+    async with session_factory() as session, session.begin():
+        schedule = await session.get(PollSchedule, token_id, with_for_update=True)
+        assert schedule is not None
+        original_priority = schedule.priority
+        schedule.coverage_next_transition_at = clock.now()
+
+    async def make_no_progress(
+        session: AsyncSession,
+        *,
+        schedule: PollSchedule,
+        now: datetime,
+        reason_code: str,
+        collector_run_id: uuid.UUID | None,
+    ) -> None:
+        del session, now, reason_code, collector_run_id
+        schedule.priority = original_priority + 50
+
+    scheduler._refresh_one_coverage = make_no_progress  # type: ignore[method-assign]
+    with pytest.raises(CoverageTransitionProgressError, match=str(token_id)):
+        await asyncio.wait_for(scheduler.claim_next_batch(), timeout=2)
+
+    async with session_factory() as session:
+        schedule = await session.get(PollSchedule, token_id)
+    assert schedule is not None
+    assert schedule.priority == original_priority
+    assert schedule.coverage_next_transition_at == clock.now()
+    assert await _schedule_gate_lock_count(session_factory) == 0
+    async with session_factory() as session, session.begin():
+        await asyncio.wait_for(
+            lock_schedule_token_fk_path(session, exclusive=True),
+            timeout=2,
+        )
 
 
 @pytest.mark.integration
