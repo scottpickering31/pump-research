@@ -45,7 +45,7 @@ from pump_research.persistence.repositories import (
 )
 from pump_research.research.asof import get_token_state_as_of
 from pump_research.research.sources import DuckDBArchiveResearchSource, PostgresResearchSource
-from pump_research.scheduling.policy import LifecycleState
+from pump_research.scheduling.policy import CoverageClass, LifecycleState
 from pump_research.scheduling.scheduler import AdaptiveScheduler
 from pump_research.security_enrichment.analysis import build_holder_metrics
 from pump_research.security_enrichment.contracts import (
@@ -186,6 +186,67 @@ async def test_four_workers_create_one_candidate_and_no_duplicate_tasks(
     assert research_state.candidate is not None
     assert research_state.candidate_tier is not None
     assert research_state.candidate_tier.new_tier == CandidateTier.TIER_1_INTERESTING.value
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_retired_candidate_overlay_stays_out_of_ordinary_due_queue(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service, epoch_id, run_id, token_id = await _subject(session_factory)
+    settings = _settings()
+    scheduler = AdaptiveScheduler(session_factory, settings)
+    fading_at = NOW - timedelta(minutes=2)
+    candidate_at = NOW + timedelta(hours=7)
+    await scheduler.set_lifecycle_state(
+        token_id=token_id,
+        state=LifecycleState.FADING,
+        decided_at=fading_at,
+        reason_code="production_transition_fixture",
+        collector_run_id=run_id,
+    )
+    async with session_factory() as session, session.begin():
+        schedule = await session.scalar(
+            select(PollSchedule)
+            .where(PollSchedule.token_id == token_id)
+            .with_for_update()
+        )
+        assert schedule is not None
+        await scheduler._refresh_one_coverage(
+            session,
+            schedule=schedule,
+            now=candidate_at,
+            reason_code="production_transition_fixture",
+            collector_run_id=run_id,
+        )
+
+    result = await service.evaluate(
+        collection_epoch_id=epoch_id,
+        collector_run_id=run_id,
+        evidence=_evidence(
+            token_id,
+            candidate_at,
+            lifecycle_state=LifecycleState.FADING.value,
+            coverage_class=CoverageClass.RETIRED_CONTROL.value,
+            coverage_resurrection=True,
+        ),
+    )
+
+    async with session_factory() as session:
+        schedule = await session.get(PollSchedule, token_id)
+        current = await session.get(CandidateCurrentState, (epoch_id, token_id))
+    assert result.changed
+    assert current is not None and current.tier == CandidateTier.TIER_1_INTERESTING.value
+    assert schedule is not None
+    assert schedule.lifecycle_state == LifecycleState.FADING.value
+    assert schedule.coverage_class == CoverageClass.RETIRED_CONTROL.value
+    assert schedule.next_due_at is None
+    assert schedule.candidate_coverage_expires_at == candidate_at + timedelta(minutes=30)
+    assert schedule.candidate_coverage_interval_seconds == 15
+    assert schedule.candidate_tier_event_id == current.latest_tier_event_id
+    assert schedule.priority == 1
+    assert schedule.target_interval_seconds == 15
+    assert schedule.effective_interval_seconds == 15
 
 
 @pytest.mark.integration

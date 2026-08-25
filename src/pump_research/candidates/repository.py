@@ -30,6 +30,7 @@ from pump_research.persistence.models import (
     PollSchedule,
     Token,
 )
+from pump_research.scheduling.policy import CoverageClass
 
 
 class CandidateIntegrityError(RuntimeError):
@@ -280,7 +281,12 @@ class CandidateRepository:
                     if value is not None
                 )
                 accelerated_due = now + timedelta(seconds=interval_seconds)
-                if schedule.next_due_at is None or accelerated_due < schedule.next_due_at:
+                if schedule.coverage_class == CoverageClass.RETIRED_CONTROL.value:
+                    # Retired work is selected only through the fixed-budget control
+                    # rotation. The candidate overlay remains durable, but it cannot
+                    # place a retired row onto the ordinary next-due queue.
+                    schedule.next_due_at = None
+                elif schedule.next_due_at is None or accelerated_due < schedule.next_due_at:
                     schedule.next_due_at = accelerated_due
                 schedule.priority = min(schedule.priority, 1)
                 schedule.target_interval_seconds = min(
