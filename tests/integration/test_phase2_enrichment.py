@@ -37,6 +37,9 @@ from pump_research.persistence.models import (
     BoostEvent,
     BoostObservation,
     MarketContextSnapshot,
+    PollBatch,
+    PollBatchMember,
+    PollSchedule,
     TokenMetadataEvent,
     TokenSecuritySnapshot,
     TokenSecurityTask,
@@ -590,6 +593,141 @@ async def test_reverse_security_batches_lock_tokens_in_database_uuid_order(
 
     assert len(locked_orders) == 2
     assert all(locked_order == ordered_token_ids for locked_order in locked_orders)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_security_parent_locks_are_compatible_with_reverse_poll_member_fk_locks(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    run_id, first_created_id, _ = await _subject(session_factory)
+    settings = Settings(
+        database_url="postgresql+asyncpg://researcher:password@localhost:5433/pump_research"
+    )
+    scheduler = AdaptiveScheduler(session_factory, settings)
+    async with session_factory() as session, session.begin():
+        second_token = await TokenRepository().get_or_create(
+            session,
+            chain="solana",
+            address="phase2-epoch7-deadlock-token",
+            first_discovered_at=NOW,
+        )
+        token_ids = tuple(sorted((first_created_id, second_token.id)))
+        for token_id in token_ids:
+            await scheduler.set_lifecycle_state_in_session(
+                session,
+                token_id=token_id,
+                state=LifecycleState.NEW,
+                decided_at=NOW,
+                admitted_at=NOW,
+                reason_code="epoch7_deadlock_regression_setup",
+            )
+        higher_uuid_schedule = await session.get(PollSchedule, token_ids[1])
+        assert higher_uuid_schedule is not None
+        higher_uuid_schedule.priority = 1
+
+    claims = tuple(
+        SecurityClaim(token_id, str(token_id), 0, uuid.uuid4()) for token_id in token_ids
+    )
+    workflow = TokenSecurityWorkflow(session_factory, _FakeSolana(), settings)
+    first_parent_locked = asyncio.Event()
+    second_member_flushed = asyncio.Event()
+    all_parent_locks_attempted = asyncio.Event()
+    first_member_flushed = asyncio.Event()
+    batch_id = uuid.uuid4()
+
+    async def security_persistence_transaction() -> None:
+        async with session_factory() as session, session.begin():
+            await workflow._lock_claimed_tokens(session, claims=claims[:1])
+            first_parent_locked.set()
+            await second_member_flushed.wait()
+            all_parent_locks_attempted.set()
+            await workflow._lock_claimed_tokens(session, claims=claims)
+            await first_member_flushed.wait()
+
+    async def poll_batch_transaction() -> None:
+        await first_parent_locked.wait()
+        async with session_factory() as session, session.begin():
+            schedules = list(
+                (
+                    await session.scalars(
+                        select(PollSchedule)
+                        .where(PollSchedule.token_id.in_(token_ids))
+                        .order_by(
+                            PollSchedule.priority,
+                            PollSchedule.next_due_at,
+                            PollSchedule.token_id,
+                        )
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            assert len(schedules) == 2
+            assert tuple(schedule.token_id for schedule in schedules) == tuple(
+                reversed(token_ids)
+            )
+            batch = PollBatch(
+                id=batch_id,
+                collector_run_id=run_id,
+                provider="dexscreener",
+                chain="solana",
+                claimed_at=NOW,
+                lease_expires_at=NOW + timedelta(seconds=30),
+                reserved_request_capacity=1,
+                batch_kind="ordinary",
+                control_window_start=None,
+                capacity_decision_id=None,
+                configuration_sha256="e" * 64,
+                configuration_snapshot={},
+            )
+            session.add(batch)
+            await session.flush()
+
+            try:
+                for index, schedule in enumerate(schedules):
+                    due_at = schedule.next_due_at
+                    assert due_at is not None
+                    session.add(
+                        PollBatchMember(
+                            claimed_at=NOW,
+                            batch_id=batch.id,
+                            token_id=schedule.token_id,
+                            due_at=due_at,
+                            lifecycle_state=schedule.lifecycle_state,
+                            coverage_class=schedule.coverage_class,
+                            priority=schedule.priority,
+                            claim_lateness_ms=0,
+                            capacity_decision_id=schedule.capacity_decision_id,
+                            target_interval_seconds=schedule.target_interval_seconds,
+                            effective_interval_seconds=schedule.effective_interval_seconds,
+                            previous_batch_id=schedule.lease_id,
+                        )
+                    )
+                    schedule.lease_id = batch.id
+                    schedule.lease_expires_at = batch.lease_expires_at
+                    schedule.last_started_at = NOW
+                    schedule.updated_at = NOW
+                    await session.flush()
+                    if index == 0:
+                        second_member_flushed.set()
+                        await all_parent_locks_attempted.wait()
+            finally:
+                first_member_flushed.set()
+
+    await asyncio.wait_for(
+        asyncio.gather(security_persistence_transaction(), poll_batch_transaction()),
+        timeout=5,
+    )
+
+    async with session_factory() as session:
+        member_token_ids = set(
+            (
+                await session.scalars(
+                    select(PollBatchMember.token_id).where(PollBatchMember.batch_id == batch_id)
+                )
+            ).all()
+        )
+    assert member_token_ids == set(token_ids)
 
 
 @pytest.mark.integration

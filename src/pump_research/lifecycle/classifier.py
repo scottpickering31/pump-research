@@ -220,7 +220,9 @@ class LifecycleClassifier:
         assert selected is not None
 
         # Keep the lock order aligned with AdaptiveScheduler: Token then PollSchedule.
-        await session.execute(select(Token.id).where(Token.id == token_id).with_for_update())
+        await session.execute(
+            select(Token.id).where(Token.id == token_id).with_for_update(key_share=True)
+        )
         schedule = (
             await session.execute(
                 select(PollSchedule).where(PollSchedule.token_id == token_id).with_for_update()

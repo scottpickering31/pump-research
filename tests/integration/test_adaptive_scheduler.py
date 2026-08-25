@@ -22,9 +22,11 @@ from pump_research.persistence.models import (
     PollScheduleDecision,
     SchedulerCapacityDecision,
     SchedulerPolicy,
+    Token,
 )
 from pump_research.persistence.repositories import TokenRepository
 from pump_research.scheduling.capacity import plan_capacity
+from pump_research.scheduling.locks import lock_schedule_token_fk_path
 from pump_research.scheduling.policy import CoverageClass, LifecycleState
 from pump_research.scheduling.scheduler import (
     AdaptiveScheduler,
@@ -34,6 +36,7 @@ from pump_research.scheduling.scheduler import (
     SchedulerCapacityDecisionIntegrityError,
     _capacity_idempotency_key,
     _legacy_admissions_statement,
+    _lock_completion_schedules,
 )
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
@@ -985,6 +988,98 @@ async def test_four_workers_survive_capacity_persistence_race_in_degraded_mode(
         await scheduler.complete_batch(batch_id=claim.batch_id, outcome=PollOutcome.EMPTY)
     clock.advance(60)
     assert await scheduler.claim_next_batch() is not None
+
+
+@pytest.mark.integration
+async def test_phase6_evidence_fence_waits_before_scheduler_schedule_token_fk_path(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The protocol closes Schedule -> Token KEY SHARE / Token -> Schedule."""
+    clock = FakeClock()
+    scheduler = AdaptiveScheduler(session_factory, _settings(), clock=clock)
+    tokens = await _schedule_tokens(
+        session_factory,
+        scheduler,
+        [("phase6-fence-cycle", "solana", LifecycleState.NEW, clock.now())],
+    )
+    token_id = tokens["phase6-fence-cycle"].id  # type: ignore[attr-defined]
+    schedule_locked = asyncio.Event()
+    phase6_gate_attempted = asyncio.Event()
+
+    async def scheduler_order() -> None:
+        async with session_factory() as session, session.begin():
+            await lock_schedule_token_fk_path(session, exclusive=False)
+            await session.scalar(
+                select(PollSchedule.token_id)
+                .where(PollSchedule.token_id == token_id)
+                .with_for_update()
+            )
+            schedule_locked.set()
+            await phase6_gate_attempted.wait()
+            await session.scalar(
+                select(Token.id)
+                .where(Token.id == token_id)
+                .with_for_update(read=True, key_share=True)
+            )
+
+    async def phase6_order() -> None:
+        await schedule_locked.wait()
+        async with session_factory() as session, session.begin():
+            phase6_gate_attempted.set()
+            await lock_schedule_token_fk_path(session, exclusive=True)
+            await session.scalar(
+                select(Token.id).where(Token.id == token_id).with_for_update()
+            )
+            await session.scalar(
+                select(PollSchedule.token_id)
+                .where(PollSchedule.token_id == token_id)
+                .with_for_update()
+            )
+
+    await asyncio.wait_for(
+        asyncio.gather(scheduler_order(), phase6_order()),
+        timeout=5,
+    )
+
+
+@pytest.mark.integration
+async def test_reverse_overlapping_completion_sets_lock_schedules_in_token_uuid_order(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Expired/reclaimed batch overlap cannot reverse PollSchedule lock order."""
+    clock = FakeClock()
+    scheduler = AdaptiveScheduler(session_factory, _settings(), clock=clock)
+    tokens = await _schedule_tokens(
+        session_factory,
+        scheduler,
+        [
+            ("completion-order-a", "solana", LifecycleState.NEW, clock.now()),
+            ("completion-order-b", "solana", LifecycleState.NEW, clock.now()),
+            ("completion-order-c", "solana", LifecycleState.NEW, clock.now()),
+        ],
+    )
+    assert all(isinstance(token, Token) for token in tokens.values())
+    ordered = sorted(token.id for token in tokens.values() if isinstance(token, Token))
+    first_input = [ordered[0], ordered[1], ordered[2]]
+    reclaimed_input = [ordered[2], ordered[1]]
+    start = asyncio.Barrier(2)
+
+    async def lock_completion(token_ids: list[uuid.UUID]) -> list[uuid.UUID]:
+        await start.wait()
+        async with session_factory() as session, session.begin():
+            schedules = await _lock_completion_schedules(session, token_ids=token_ids)
+            return [schedule.token_id for schedule in schedules]
+
+    locked_orders = await asyncio.wait_for(
+        asyncio.gather(
+            lock_completion(first_input),
+            lock_completion(reclaimed_input),
+        ),
+        timeout=5,
+    )
+
+    assert locked_orders[0] == sorted(first_input)
+    assert locked_orders[1] == sorted(reclaimed_input)
 
 
 @pytest.mark.integration

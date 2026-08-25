@@ -36,14 +36,13 @@ from pump_research.persistence.models import (
 from pump_research.persistence.repositories import _normalize_utc
 from pump_research.scheduling.capacity import CapacityMode, CapacityPlan, plan_capacity
 from pump_research.scheduling.clock import Clock, SystemClock
+from pump_research.scheduling.locks import lock_schedule_token_fk_path
 from pump_research.scheduling.policy import (
     AdaptivePollingPolicy,
     CapacityTier,
     CoverageClass,
     LifecycleState,
 )
-
-_CLAIM_ADVISORY_LOCK_ID = 7_428_901_163
 
 
 class PollOutcome(StrEnum):
@@ -197,6 +196,7 @@ class AdaptiveScheduler:
         """Reconstruct legacy coverage and deterministically rebase one epoch."""
         normalized_started_at = _normalize_utc(started_at, "started_at")
         assert normalized_started_at is not None
+        await lock_schedule_token_fk_path(session, exclusive=False)
         await self._persist_coverage_policy(session)
         schedules = list(
             (
@@ -334,8 +334,14 @@ class AdaptiveScheduler:
         assert normalized_decided_at is not None
         # The token exists before its schedule. Locking it closes the otherwise
         # unavoidable check-then-insert race between first-time scheduler writers.
+        # Its immutable key needs coordination, not a lock that conflicts with
+        # child-row FK checks performed by poll and coverage evidence writers.
         (
-            await session.execute(select(Token.id).where(Token.id == token_id).with_for_update())
+            await session.execute(
+                select(Token.id)
+                .where(Token.id == token_id)
+                .with_for_update(key_share=True)
+            )
         ).scalar_one()
         task = (
             await session.execute(
@@ -502,7 +508,7 @@ class AdaptiveScheduler:
         """Claim one bounded batch, subject to fairness, capacity, and request budget."""
         now = self._normalized_now()
         async with self._session_factory() as session, session.begin():
-            await session.execute(select(func.pg_advisory_xact_lock(_CLAIM_ADVISORY_LOCK_ID)))
+            await lock_schedule_token_fk_path(session, exclusive=True)
             await self._advance_coverage_transitions(
                 session, now=now, collector_run_id=collector_run_id
             )
@@ -812,8 +818,14 @@ class AdaptiveScheduler:
         api_request_log_id: uuid.UUID | None = None,
         failure_detail: dict[str, object] | None = None,
     ) -> PollCompletion:
-        """Transactional form used with observation facts from the claimed batch."""
+        """Transactional form used with observation facts from the claimed batch.
+
+        Callers that write token-referencing facts earlier in the transaction must
+        enter ``lock_schedule_token_fk_path`` before those writes. Re-acquiring its
+        shared form here is transaction-local and protects direct callers.
+        """
         completed_at = self._normalized_now()
+        await lock_schedule_token_fk_path(session, exclusive=False)
         batch = (
             await session.execute(
                 select(PollBatch).where(PollBatch.id == batch_id).with_for_update()
@@ -847,14 +859,9 @@ class AdaptiveScheduler:
                 )
             ).scalars()
         )
-        schedules = list(
-            (
-                await session.execute(
-                    select(PollSchedule)
-                    .where(PollSchedule.token_id.in_([member.token_id for member in members]))
-                    .with_for_update()
-                )
-            ).scalars()
+        schedules = await _lock_completion_schedules(
+            session,
+            token_ids=[member.token_id for member in members],
         )
         schedule_by_token = {schedule.token_id: schedule for schedule in schedules}
         if (
@@ -1642,6 +1649,28 @@ def _coverage_decision_idempotency_key(
 
 def _lateness_ms(*, observed_at: datetime, due_at: datetime) -> int:
     return max(0, int((observed_at - due_at).total_seconds() * 1_000))
+
+
+async def _lock_completion_schedules(
+    session: AsyncSession,
+    *,
+    token_ids: list[uuid.UUID],
+) -> list[PollSchedule]:
+    """Lock every completion schedule in the global token UUID order.
+
+    Expired batches can overlap a reclaimed batch.  SQL ``IN`` input and result
+    order are not lock-order guarantees, so the database ORDER BY is mandatory.
+    """
+    return list(
+        (
+            await session.scalars(
+                select(PollSchedule)
+                .where(PollSchedule.token_id.in_(token_ids))
+                .order_by(PollSchedule.token_id)
+                .with_for_update()
+            )
+        ).all()
+    )
 
 
 def _completion_from_model(model: PollBatchOutcome) -> PollCompletion:

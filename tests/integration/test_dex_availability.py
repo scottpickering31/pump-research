@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from pump_research.collection.dex_availability import DexAvailabilityWorkflow
@@ -272,3 +275,85 @@ async def test_restart_recovers_a_leased_pending_token_and_promotes_when_present
     assert poll_schedule.lifecycle_state == "NEW"
     assert poll_schedule.next_due_at == NOW + timedelta(seconds=26)
     assert states == ["PENDING_DEX", "NEW"]
+
+
+@pytest.mark.integration
+async def test_task_only_joined_claim_is_exactly_once_and_does_not_lock_token(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The joined token is read-only; the durable lease lives on the task row."""
+    workflow = DexAvailabilityWorkflow(
+        session_factory,
+        FakeDexSource(present_addresses=set(), received_at=NOW),
+        _settings(),
+    )
+    admission = await workflow.admit_discovery(_discovery_event("task-only-lock-target"))
+    token_locked = asyncio.Event()
+    release_token = asyncio.Event()
+    start_claims = asyncio.Barrier(2)
+    task_repository = DexAvailabilityTaskRepository()
+
+    async def hold_unnecessary_parent_lock() -> None:
+        async with session_factory() as session, session.begin():
+            await session.scalar(
+                select(Token.id)
+                .where(Token.id == admission.token_id)
+                .with_for_update()
+            )
+            token_locked.set()
+            await release_token.wait()
+
+    async def claim(worker: int) -> list[object]:
+        del worker
+        await token_locked.wait()
+        await start_claims.wait()
+        async with session_factory() as session, session.begin():
+            return list(
+                await task_repository.claim_due(
+                    session,
+                    now=NOW,
+                    limit=1,
+                    lease_duration=timedelta(seconds=10),
+                )
+            )
+
+    holder = asyncio.create_task(hold_unnecessary_parent_lock())
+    claims = await asyncio.wait_for(
+        asyncio.gather(claim(1), claim(2)),
+        timeout=2,
+    )
+    release_token.set()
+    await holder
+
+    flat = [item for group in claims for item in group]
+    assert len(flat) == 1
+    owned = flat[0]
+    assert owned.token_id == admission.token_id  # type: ignore[attr-defined]
+
+    async with session_factory() as session, session.begin():
+        with pytest.raises(RuntimeError, match="lease is no longer owned"):
+            await task_repository.complete_with_retry(
+                session,
+                token_ids=[admission.token_id],
+                lease_id=uuid.uuid4(),
+                checked_at=NOW,
+                retry_at=NOW + timedelta(minutes=1),
+            )
+
+    async with session_factory() as session, session.begin():
+        await task_repository.complete_with_retry(
+            session,
+            token_ids=[admission.token_id],
+            lease_id=owned.lease_id,  # type: ignore[attr-defined]
+            checked_at=NOW,
+            retry_at=NOW + timedelta(minutes=1),
+        )
+
+    with pytest.raises(IntegrityError):
+        async with session_factory() as session, session.begin():
+            await session.execute(delete(Token).where(Token.id == admission.token_id))
+            await session.flush()
+
+    async with session_factory() as session:
+        assert await session.get(Token, admission.token_id) is not None
+        assert await session.get(DexAvailabilityTask, admission.token_id) is not None

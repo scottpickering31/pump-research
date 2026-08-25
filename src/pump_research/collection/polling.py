@@ -35,6 +35,7 @@ from pump_research.persistence.repositories import (
     PairRepository,
     PairTokenMismatchError,
 )
+from pump_research.scheduling.locks import lock_schedule_token_fk_path
 from pump_research.scheduling.scheduler import AdaptiveScheduler, PollBatchClaim, PollOutcome
 
 _ENDPOINT = "/tokens/v1/{chain_id}/{token_addresses}"
@@ -152,6 +153,10 @@ class ScheduledObservationWorkflow:
         batch = result.batches[0]
         classification_error: Exception | None = None
         async with self._session_factory() as session, session.begin():
+            # This transaction writes token-referencing evidence before it locks
+            # PollSchedule during completion. Enter the shared side of the Phase 6
+            # fence protocol before either resource family is touched.
+            await lock_schedule_token_fk_path(session, exclusive=False)
             build = await self._observation_creates(session, claim, result)
             empty_addresses = [
                 member.address
@@ -417,6 +422,7 @@ class ScheduledObservationWorkflow:
             else PollOutcome.FAILED
         )
         async with self._session_factory() as session, session.begin():
+            await lock_schedule_token_fk_path(session, exclusive=False)
             request = await self._requests.record(
                 session,
                 collector_run_id=collector_run_id,

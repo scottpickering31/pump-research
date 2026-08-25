@@ -87,7 +87,9 @@ class CandidateRepository:
         token_id = uuid.UUID(evidence.token_id)
         # Lock the canonical token before checking/inserting the projection. This
         # serializes first nomination without relying on an in-memory worker lock.
-        await session.scalar(select(Token.id).where(Token.id == token_id).with_for_update())
+        await session.scalar(
+            select(Token.id).where(Token.id == token_id).with_for_update(key_share=True)
+        )
         current = await session.scalar(
             select(CandidateCurrentState)
             .where(

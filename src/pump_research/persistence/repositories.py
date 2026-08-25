@@ -484,7 +484,7 @@ class DexAvailabilityTaskRepository:
             )
             .order_by(DexAvailabilityTask.next_check_at, DexAvailabilityTask.token_id)
             .limit(limit)
-            .with_for_update(skip_locked=True)
+            .with_for_update(skip_locked=True, of=DexAvailabilityTask)
         )
         rows = result.all()
         if not rows:

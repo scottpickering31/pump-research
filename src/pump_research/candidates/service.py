@@ -31,6 +31,7 @@ from pump_research.persistence.models import (
     TokenSecuritySnapshot,
     TraderDistributionSnapshot,
 )
+from pump_research.scheduling.locks import lock_schedule_token_fk_path
 
 _BOOST_WAKEUP_BUDGET_LOCK = 7_428_901_165
 
@@ -319,6 +320,11 @@ class CandidateOrchestrationService:
     ) -> CandidateTransitionResult | None:
         """Re-evaluate Tier 2/3 from newly received Phase 6 evidence."""
         async with self._session_factory() as session, session.begin():
+            # Scheduler transactions that already own PollSchedule and will emit
+            # token-referencing evidence hold the shared side of this gate. Drain
+            # them before taking Token UPDATE so the immutable-evidence fence
+            # cannot form Schedule -> Token / Token -> Schedule.
+            await lock_schedule_token_fk_path(session, exclusive=True)
             # Serialize the evidence read itself, not merely the eventual tier
             # write. Otherwise workers that finish at one received-at watermark
             # can each evaluate a different partial commit set.

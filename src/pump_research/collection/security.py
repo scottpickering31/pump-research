@@ -221,7 +221,13 @@ class TokenSecurityWorkflow:
         *,
         claims: tuple[SecurityClaim, ...],
     ) -> tuple[uuid.UUID, ...]:
-        """Establish the canonical parent-before-child lock order for persistence."""
+        """Lock parents before task rows without conflicting with child FK checks.
+
+        Token identity keys are immutable. ``FOR NO KEY UPDATE`` therefore supplies
+        the required parent-before-child coordination with lifecycle writers while
+        remaining compatible with PostgreSQL's ``FOR KEY SHARE`` token FK checks.
+        Multi-token parent locks must always follow database UUID order.
+        """
         token_ids = tuple(sorted({claim.token_id for claim in claims}))
         locked_token_ids = tuple(
             (
@@ -229,7 +235,7 @@ class TokenSecurityWorkflow:
                     select(Token.id)
                     .where(Token.id.in_(token_ids))
                     .order_by(Token.id)
-                    .with_for_update()
+                    .with_for_update(key_share=True)
                 )
             ).all()
         )
