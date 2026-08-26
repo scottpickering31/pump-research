@@ -1189,6 +1189,190 @@ async def test_capacity_decision_replay_and_restart_are_idempotent(
 
 
 @pytest.mark.integration
+async def test_capacity_decision_is_frozen_for_root_transaction_across_cache_bucket_change(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """One root transaction cannot acquire two capacity identities."""
+    clock = FakeClock()
+    scheduler = AdaptiveScheduler(session_factory, _settings(), clock=clock)
+
+    async with session_factory() as session:
+        async with session.begin():
+            first = await scheduler._capacity_decision(session, now=clock.now())
+            clock.advance(30)
+            scheduler._cached_capacity_bucket = None
+            scheduler._cached_capacity_decision = None
+            second = await scheduler._capacity_decision(session, now=clock.now())
+
+        clock.advance(30)
+        scheduler._cached_capacity_bucket = None
+        scheduler._cached_capacity_decision = None
+        async with session.begin():
+            next_transaction = await scheduler._capacity_decision(session, now=clock.now())
+
+    assert second is first
+    assert second.id == first.id
+    assert next_transaction.id != first.id
+    async with session_factory() as session:
+        identities = set(
+            await session.scalars(
+                select(SchedulerCapacityDecision.id).where(
+                    SchedulerCapacityDecision.id.in_((first.id, next_transaction.id))
+                )
+            )
+        )
+    assert identities == {first.id, next_transaction.id}
+
+
+@pytest.mark.integration
+async def test_capacity_decision_transaction_owner_does_not_survive_rollback(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A later root transaction never inherits a rolled-back transaction's owner."""
+    clock = FakeClock()
+    scheduler = AdaptiveScheduler(session_factory, _settings(), clock=clock)
+
+    async with session_factory() as session:
+        with pytest.raises(RuntimeError, match="force capacity rollback"):
+            async with session.begin():
+                rolled_back = await scheduler._capacity_decision(session, now=clock.now())
+                raise RuntimeError("force capacity rollback")
+
+        clock.advance(30)
+        scheduler._cached_capacity_bucket = None
+        scheduler._cached_capacity_decision = None
+        async with session.begin():
+            committed = await scheduler._capacity_decision(session, now=clock.now())
+
+    assert committed.id != rolled_back.id
+    async with session_factory() as session:
+        stored_ids = set(await session.scalars(select(SchedulerCapacityDecision.id)))
+    assert rolled_back.id not in stored_ids
+    assert committed.id in stored_ids
+
+
+@pytest.mark.integration
+async def test_capacity_decision_is_re_persisted_after_savepoint_rollback(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A savepoint rollback cannot strand the root transaction's capacity owner."""
+    clock = FakeClock()
+    scheduler = AdaptiveScheduler(session_factory, _settings(), clock=clock)
+
+    async with session_factory() as session:
+        root = await session.begin()
+        savepoint = await session.begin_nested()
+        first = await scheduler._capacity_decision(session, now=clock.now())
+        assert await session.scalar(
+            select(func.count())
+            .select_from(SchedulerCapacityDecision)
+            .where(SchedulerCapacityDecision.id == first.id)
+        ) == 1
+
+        await savepoint.rollback()
+
+        assert session.get_transaction() is root
+        assert root.is_active
+        assert await session.scalar(
+            select(func.count())
+            .select_from(SchedulerCapacityDecision)
+            .where(SchedulerCapacityDecision.id == first.id)
+        ) == 0
+
+        second = await scheduler._capacity_decision(session, now=clock.now())
+        assert second is first
+        assert second.id == first.id
+        assert await session.scalar(
+            select(func.count())
+            .select_from(SchedulerCapacityDecision)
+            .where(SchedulerCapacityDecision.id == first.id)
+        ) == 1
+        await root.commit()
+
+    async with session_factory() as session:
+        assert await session.scalar(
+            select(func.count())
+            .select_from(SchedulerCapacityDecision)
+            .where(SchedulerCapacityDecision.id == first.id)
+        ) == 1
+
+
+@pytest.mark.integration
+async def test_scheduler_instances_with_same_policy_share_transaction_capacity_owner(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Scheduler-local cache state cannot split one transaction's capacity identity."""
+    clock = FakeClock()
+    settings = _settings()
+    first_scheduler = AdaptiveScheduler(session_factory, settings, clock=clock)
+    second_scheduler = AdaptiveScheduler(session_factory, settings, clock=clock)
+    later = clock.now() + timedelta(seconds=30)
+
+    async with session_factory() as session:
+        preparation = await session.begin()
+        independently_cached = await second_scheduler._capacity_decision(
+            session,
+            now=later,
+        )
+        await preparation.rollback()
+
+    assert second_scheduler._cached_capacity_decision is independently_cached
+
+    async with session_factory() as session:
+        root = await session.begin()
+        owner = await first_scheduler._capacity_decision(session, now=clock.now())
+        assert independently_cached.id != owner.id
+
+        reused = await second_scheduler._capacity_decision(session, now=later)
+
+        assert reused is owner
+        assert reused.id == owner.id
+        assert second_scheduler._cached_capacity_decision is independently_cached
+        assert set(await session.scalars(select(SchedulerCapacityDecision.id))) == {owner.id}
+        await root.commit()
+
+
+@pytest.mark.integration
+async def test_scheduler_instances_with_different_policies_reject_transaction_owner(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A root transaction rejects a second scheduler policy and capacity identity."""
+    clock = FakeClock()
+    first_scheduler = AdaptiveScheduler(session_factory, _settings(), clock=clock)
+    second_scheduler = AdaptiveScheduler(
+        session_factory,
+        _settings(scheduler_capacity_headroom_ratio=0.25),
+        clock=clock,
+    )
+    assert first_scheduler.policy.sha256 != second_scheduler.policy.sha256
+
+    async with session_factory() as session:
+        preparation = await session.begin()
+        rejected_identity = await second_scheduler._capacity_decision(
+            session,
+            now=clock.now(),
+        )
+        await preparation.rollback()
+
+    async with session_factory() as session:
+        root = await session.begin()
+        owner = await first_scheduler._capacity_decision(session, now=clock.now())
+        assert rejected_identity.id != owner.id
+
+        with pytest.raises(
+            SchedulerCapacityDecisionIntegrityError,
+            match="one transaction cannot use different scheduler policies",
+        ):
+            await second_scheduler._capacity_decision(session, now=clock.now())
+
+        stored = list(await session.scalars(select(SchedulerCapacityDecision)))
+        assert [decision.id for decision in stored] == [owner.id]
+        assert stored[0].policy_sha256 == first_scheduler.policy.sha256
+        assert rejected_identity.id not in {decision.id for decision in stored}
+        await root.commit()
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "collision_kind",
     ("same_both", "same_id_different_key", "different_id_same_key"),

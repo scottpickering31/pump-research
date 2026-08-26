@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from sqlalchemy import func, select
@@ -11,7 +12,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from pump_research.config import Settings
 from pump_research.lifecycle.classifier import LifecycleClassifier
 from pump_research.lifecycle.policy import LifecycleTransitionRule
-from pump_research.persistence.models import LifecycleEvent, Observation, PollSchedule, Token
+from pump_research.persistence.models import (
+    CoverageDecision,
+    LifecycleEvent,
+    Observation,
+    PollSchedule,
+    PollScheduleDecision,
+    Token,
+)
 from pump_research.persistence.repositories import (
     ApiRequestLogRepository,
     ObservationCreate,
@@ -254,6 +262,128 @@ async def test_supported_transitions_record_complete_reconstructable_evidence(
     assert event.configuration_sha256 == classifier.policy.sha256
     assert event.configuration_snapshot == classifier.policy.snapshot
     assert token_count == 1
+
+
+@pytest.mark.integration
+async def test_scheduled_request_transitions_own_one_capacity_identity(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """All lifecycle transitions in one scheduled request share its capacity owner."""
+    clock = FakeClock()
+    settings = _settings()
+    scheduler = AdaptiveScheduler(session_factory, settings, clock=clock)
+    tokens: list[Token] = []
+    pairs = []
+    token_repository = TokenRepository()
+    pair_repository = PairRepository()
+    request_repository = ApiRequestLogRepository()
+    observation_repository = ObservationRepository()
+    async with session_factory() as session, session.begin():
+        for index in range(2):
+            token = await token_repository.get_or_create(
+                session,
+                chain="solana",
+                address=f"scheduled-capacity-owner-{index}",
+                first_discovered_at=clock.now(),
+            )
+            pair = await pair_repository.get_or_create(
+                session,
+                token_id=token.id,
+                chain="solana",
+                address=f"scheduled-capacity-owner-pair-{index}",
+                dex_identifier="test-dex",
+                first_discovered_at=clock.now(),
+            )
+            await scheduler.set_lifecycle_state_in_session(
+                session,
+                token_id=token.id,
+                state=LifecycleState.NEW,
+                decided_at=clock.now(),
+                admitted_at=clock.now(),
+                reason_code="scheduled_capacity_owner_setup",
+            )
+            tokens.append(token)
+            pairs.append(pair)
+
+    clock.advance()
+    async with session_factory() as session, session.begin():
+        request = await request_repository.record(
+            session,
+            idempotency_key="scheduled-capacity-owner-request",
+            provider="test",
+            endpoint="/test",
+            requested_at=clock.now(),
+            received_at=clock.now(),
+            outcome="succeeded",
+            http_status_code=200,
+            request_payload={},
+            response_payload={},
+        )
+        inserted = await observation_repository.record_many(
+            session,
+            api_request=request,
+            observations=[
+                ObservationCreate(pair_id=pair.id, volume_m5_usd=Decimal("100"))
+                for pair in pairs
+            ],
+        )
+        assert inserted == 2
+
+    original_persist = scheduler._persist_capacity_decision
+    attempted_ids = []
+
+    async def persist_and_replace_process_cache(
+        session: AsyncSession,
+        decision: Any,
+    ) -> None:
+        attempted_ids.append(decision.id)
+        await original_persist(session, decision)
+        scheduler._cached_capacity_bucket = None
+        scheduler._cached_capacity_decision = None
+
+    scheduler._persist_capacity_decision = persist_and_replace_process_cache  # type: ignore[method-assign]
+    classifier = LifecycleClassifier(
+        session_factory,
+        settings,
+        clock=clock,
+        scheduler=scheduler,
+    )
+    async with session_factory() as session, session.begin():
+        evaluation = await classifier.evaluate_request_in_session(
+            session,
+            api_request_log_id=request.id,
+        )
+
+    assert len(evaluation.transitions) == 2
+    assert len(set(attempted_ids)) == 1
+    token_ids = [token.id for token in tokens]
+    async with session_factory() as session:
+        schedule_ids = set(
+            await session.scalars(
+                select(PollSchedule.capacity_decision_id).where(
+                    PollSchedule.token_id.in_(token_ids)
+                )
+            )
+        )
+        coverage_ids = set(
+            await session.scalars(
+                select(CoverageDecision.capacity_decision_id).where(
+                    CoverageDecision.token_id.in_(token_ids),
+                    CoverageDecision.reason_code == LifecycleTransitionRule.NEW_TO_ACTIVE.value,
+                )
+            )
+        )
+        schedule_decision_ids = set(
+            await session.scalars(
+                select(PollScheduleDecision.capacity_decision_id).where(
+                    PollScheduleDecision.token_id.in_(token_ids),
+                    PollScheduleDecision.reason_code == LifecycleTransitionRule.NEW_TO_ACTIVE.value,
+                )
+            )
+        )
+    assert schedule_ids == set(attempted_ids)
+    assert coverage_ids == set(attempted_ids)
+    assert schedule_decision_ids == set(attempted_ids)
 
 
 @pytest.mark.integration

@@ -24,9 +24,11 @@ from pump_research.persistence.models import (
     DiscoveryEvent,
     LifecycleEvent,
     PollSchedule,
+    SchedulerCapacityDecision,
     Token,
 )
 from pump_research.persistence.repositories import DexAvailabilityTaskRepository
+from pump_research.scheduling.scheduler import AdaptiveScheduler
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 
@@ -165,6 +167,64 @@ async def test_due_pending_tokens_are_checked_in_one_dex_batch(
     assert len(dex.calls) == 1
     assert dex.calls[0][0] == "solana"
     assert set(dex.calls[0][1]) == set(addresses)
+
+
+@pytest.mark.integration
+async def test_multi_token_promotion_owns_one_capacity_identity_per_transaction(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A DEX-availability batch cannot change capacity identity between tokens."""
+    addresses = (
+        "capacity-owner-pending-one",
+        "capacity-owner-pending-two",
+        "capacity-owner-pending-three",
+    )
+    dex = FakeDexSource(
+        present_addresses=set(addresses),
+        received_at=NOW + timedelta(seconds=1),
+    )
+    settings = _settings()
+    scheduler = AdaptiveScheduler(session_factory, settings)
+    workflow = DexAvailabilityWorkflow(
+        session_factory,
+        dex,
+        settings,
+        scheduler=scheduler,
+    )
+    token_ids = []
+    for address in addresses:
+        admission = await workflow.admit_discovery(_discovery_event(address))
+        token_ids.append(admission.token_id)
+
+    original_persist = scheduler._persist_capacity_decision
+    attempted_ids: list[uuid.UUID] = []
+
+    async def persist_and_replace_process_cache(
+        session: AsyncSession,
+        decision: Any,
+    ) -> None:
+        attempted_ids.append(decision.id)
+        await original_persist(session, decision)
+        scheduler._cached_capacity_bucket = None
+        scheduler._cached_capacity_decision = None
+
+    scheduler._persist_capacity_decision = persist_and_replace_process_cache  # type: ignore[method-assign]
+
+    result = await workflow.check_due(now=NOW)
+
+    assert result.promoted_new_tokens == len(addresses)
+    assert len(set(attempted_ids)) == 1
+    async with session_factory() as session:
+        referenced_ids = set(
+            await session.scalars(
+                select(PollSchedule.capacity_decision_id).where(
+                    PollSchedule.token_id.in_(token_ids)
+                )
+            )
+        )
+        durable_ids = set(await session.scalars(select(SchedulerCapacityDecision.id)))
+    assert referenced_ids == set(attempted_ids)
+    assert durable_ids == set(attempted_ids)
 
 
 @pytest.mark.integration

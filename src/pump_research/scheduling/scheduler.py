@@ -127,6 +127,15 @@ class _CapacityDecision:
     plan: CapacityPlan
 
 
+@dataclass(frozen=True, slots=True)
+class _CapacityDecisionTransactionOwner:
+    """The one capacity identity frozen for a root database transaction."""
+
+    transaction: object
+    policy_sha256: str
+    decision: _CapacityDecision
+
+
 def _legacy_admissions_statement() -> Select[tuple[uuid.UUID, datetime]]:
     """Resolve the legacy population relationally, without a per-token bind list."""
     return (
@@ -148,6 +157,10 @@ def _legacy_admissions_statement() -> Select[tuple[uuid.UUID, datetime]]:
 
 class AdaptiveScheduler:
     """Plan adaptive token polls using durable schedules and expiring leases."""
+
+    _CAPACITY_TRANSACTION_OWNER_KEY = (
+        "pump_research.scheduler_capacity_decision_transaction_owner"
+    )
 
     def __init__(
         self,
@@ -1025,6 +1038,25 @@ class AdaptiveScheduler:
         *,
         now: datetime,
     ) -> _CapacityDecision:
+        transaction = session.get_transaction()
+        if transaction is None:
+            raise RuntimeError("capacity planning requires an active root transaction")
+        owner = session.info.get(self._CAPACITY_TRANSACTION_OWNER_KEY)
+        if (
+            isinstance(owner, _CapacityDecisionTransactionOwner)
+            and owner.transaction is transaction
+        ):
+            if owner.policy_sha256 != self.policy.sha256:
+                raise SchedulerCapacityDecisionIntegrityError(
+                    "one transaction cannot use different scheduler policies for capacity planning"
+                )
+            # A nested savepoint may have rolled back the first insert while the
+            # root transaction remains active. Re-persisting the same identity is
+            # safe and preserves the one-identity invariant in that case.
+            await self._persist_capacity_decision(session, owner.decision)
+            self._log_capacity_decision(owner.decision)
+            return owner.decision
+
         bucket = _time_bucket(now, self.policy.capacity_refresh)
         cached = self._cached_capacity_decision
         if cached is None or self._cached_capacity_bucket != bucket:
@@ -1043,6 +1075,14 @@ class AdaptiveScheduler:
             self._cached_capacity_bucket = bucket
             self._cached_capacity_decision = cached
         await self._persist_capacity_decision(session, cached)
+        current_transaction = session.get_transaction()
+        if current_transaction is not transaction:
+            raise RuntimeError("capacity planning root transaction changed during persistence")
+        session.info[self._CAPACITY_TRANSACTION_OWNER_KEY] = _CapacityDecisionTransactionOwner(
+            transaction=transaction,
+            policy_sha256=self.policy.sha256,
+            decision=cached,
+        )
         self._log_capacity_decision(cached)
         return cached
 
