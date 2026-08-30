@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
 import structlog
 from sqlalchemy import func, select
@@ -33,6 +34,7 @@ from pump_research.lifecycle.classifier import LifecycleClassifier, LifecycleReq
 from pump_research.market_data.dexscreener import (
     DexScreenerBatchResult,
     DexScreenerTokenPairsResult,
+    DexScreenerTransportError,
 )
 from pump_research.market_data.dexscreener_models import DexScreenerPair
 from pump_research.persistence.models import (
@@ -845,6 +847,22 @@ class IntegratedBoosts:
         self.feeds.add(feed_kind)
 
 
+class TransportDegradingBoosts:
+    def __init__(self) -> None:
+        self.latest_calls = 0
+
+    async def collect(self, *, feed_kind: str, **_: object) -> None:
+        if feed_kind != "latest":
+            return
+        self.latest_calls += 1
+        request = httpx.Request("GET", "https://dexscreener.test/token-boosts/latest/v1")
+        cause = httpx.ConnectError(
+            "[Errno -3] Temporary failure in name resolution",
+            request=request,
+        )
+        raise DexScreenerTransportError(attempt_count=3) from cause
+
+
 class IntegratedSecurity:
     def __init__(self) -> None:
         self.calls = 0
@@ -1006,6 +1024,67 @@ async def test_persisted_component_failure_marks_worker_degraded_without_hiding_
         assert task.done() is False
         assert health is not None
         assert health.last_success_at is not None
+    finally:
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=2)
+
+
+@pytest.mark.integration
+async def test_exhausted_boost_transport_error_degrades_without_stopping_task_group(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = _settings().model_copy(
+        update={
+            "collector_discovery_poll_seconds": 60,
+            "collector_reconciliation_poll_seconds": 60,
+            "collector_scheduler_poll_seconds": 60,
+            "collector_heartbeat_seconds": 60,
+            "storage_telemetry_interval_seconds": 60,
+            "boost_latest_poll_seconds": 60,
+            "boost_top_poll_seconds": 60,
+        }
+    )
+    boosts = TransportDegradingBoosts()
+    worker = CollectorWorker(
+        session_factory,
+        settings,
+        discovery=QuietDiscovery(),  # type: ignore[arg-type]
+        availability=IntegratedAvailability(),  # type: ignore[arg-type]
+        scheduler=IdleScheduler(),  # type: ignore[arg-type]
+        polling=IdlePolling(),  # type: ignore[arg-type]
+        logger=structlog.get_logger("test.boost-transport-degraded-worker"),
+        boosts=boosts,  # type: ignore[arg-type]
+    )
+    async with session_factory() as session, session.begin():
+        run = await CollectorRunRepository().start(
+            session,
+            started_at=NOW,
+            collector_version="test",
+            configuration_sha256="b" * 64,
+            configuration_snapshot={},
+        )
+    shutdown = asyncio.Event()
+    task = asyncio.create_task(worker.run(run_id=run.id, shutdown=shutdown))
+    try:
+        for _ in range(200):
+            async with session_factory() as session:
+                current_status = await session.scalar(
+                    select(CollectorComponentHealth.status).where(
+                        CollectorComponentHealth.component_name == "boost_latest"
+                    )
+                )
+            if current_status == "degraded":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("boost_latest health never became degraded")
+        async with session_factory() as session:
+            health = await session.get(CollectorComponentHealth, "boost_latest")
+        assert boosts.latest_calls == 1
+        assert task.done() is False
+        assert health is not None
+        assert health.detail is not None
+        assert health.detail["error_type"] == "DexScreenerTransportError"
     finally:
         shutdown.set()
         await asyncio.wait_for(task, timeout=2)

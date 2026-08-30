@@ -47,6 +47,17 @@ class DexScreenerHttpError(DexScreenerError):
         super().__init__(f"DEX Screener returned HTTP {status_code}")
 
 
+class DexScreenerTransportError(DexScreenerError):
+    """An exhausted DEX Screener transport failure."""
+
+    def __init__(self, *, attempt_count: int) -> None:
+        self.attempt_count = attempt_count
+        self.dexscreener_attempt_count = attempt_count
+        super().__init__(
+            f"DEX Screener transport failed after {attempt_count} attempt(s)"
+        )
+
+
 class DexScreenerResponseParseError(DexScreenerError):
     """A successful HTTP response that does not match the documented list shape."""
 
@@ -249,6 +260,8 @@ class DexScreenerClient:
                 with attempt:
                     result = await self._send_boost_request(feed_kind=feed_kind)
                     return replace(result, attempt_count=attempt_count)
+        except httpx.TransportError as error:
+            raise DexScreenerTransportError(attempt_count=attempt_count) from error
         except BaseException as error:
             error.__dict__["dexscreener_attempt_count"] = attempt_count
             raise
@@ -286,6 +299,8 @@ class DexScreenerClient:
                         token_addresses=token_addresses,
                     )
                     return replace(result, attempt_count=attempt_count)
+        except httpx.TransportError as error:
+            raise DexScreenerTransportError(attempt_count=attempt_count) from error
         except BaseException as error:
             error.__dict__["dexscreener_attempt_count"] = attempt_count
             raise

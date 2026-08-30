@@ -8,8 +8,10 @@ import pytest
 from pump_research.config import Settings
 from pump_research.market_data.dexscreener import (
     DexScreenerClient,
+    DexScreenerError,
     DexScreenerMetrics,
     DexScreenerResponseParseError,
+    DexScreenerTransportError,
 )
 from pump_research.market_data.rate_limiter import AsyncRateLimiter
 
@@ -155,13 +157,16 @@ async def test_throttled_request_retries_through_the_client() -> None:
 
 
 @pytest.mark.asyncio
-async def test_http_timeout_retries_then_surfaces_failure() -> None:
+async def test_token_pair_transport_failure_retries_then_surfaces_domain_error() -> None:
     attempts = 0
+    failures: list[httpx.ReadTimeout] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal attempts
         attempts += 1
-        raise httpx.ReadTimeout("simulated timeout", request=request)
+        failure = httpx.ReadTimeout("simulated timeout", request=request)
+        failures.append(failure)
+        raise failure
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url=TEST_BASE_URL
@@ -173,16 +178,62 @@ async def test_http_timeout_retries_then_surfaces_failure() -> None:
             rate_limiter=_fast_limiter(),
             metrics=metrics,
         )
-        with pytest.raises(httpx.ReadTimeout, match="simulated timeout") as captured:
+        with pytest.raises(
+            DexScreenerTransportError,
+            match=r"transport failed after 2 attempt\(s\)",
+        ) as captured:
             await client.fetch_token_pairs(
                 chain_id="solana",
                 token_addresses=["timeout-token"],
             )
 
     assert attempts == 2
-    assert captured.value.__dict__["dexscreener_attempt_count"] == 2
+    assert isinstance(captured.value, DexScreenerError)
+    assert not isinstance(captured.value, httpx.TransportError)
+    assert captured.value.attempt_count == 2
+    assert captured.value.dexscreener_attempt_count == 2
+    assert captured.value.__cause__ is failures[-1]
     assert metrics.retries == 1
     assert metrics.http_requests_failed == 2
+
+
+@pytest.mark.asyncio
+async def test_boost_connect_error_retries_then_surfaces_domain_error() -> None:
+    attempts = 0
+    failures: list[httpx.ConnectError] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        failure = httpx.ConnectError(
+            "[Errno -3] Temporary failure in name resolution",
+            request=request,
+        )
+        failures.append(failure)
+        raise failure
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url=TEST_BASE_URL
+    ) as http:
+        metrics = DexScreenerMetrics()
+        client = DexScreenerClient(
+            _settings(max_attempts=3),
+            http_client=http,
+            rate_limiter=_fast_limiter(),
+            boost_rate_limiter=_fast_limiter(),
+            metrics=metrics,
+        )
+        with pytest.raises(DexScreenerTransportError) as captured:
+            await client.fetch_boost_feed(feed_kind="latest")
+
+    assert attempts == 3
+    assert isinstance(captured.value, DexScreenerError)
+    assert not isinstance(captured.value, httpx.TransportError)
+    assert captured.value.attempt_count == 3
+    assert captured.value.dexscreener_attempt_count == 3
+    assert captured.value.__cause__ is failures[-1]
+    assert metrics.retries == 2
+    assert metrics.http_requests_failed == 3
 
 
 @pytest.mark.asyncio
