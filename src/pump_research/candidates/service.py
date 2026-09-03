@@ -239,6 +239,12 @@ class CandidateOrchestrationService:
         collector_run_id: uuid.UUID,
     ) -> CandidateTransitionResult | None:
         """Wake a tracked retired token subject to a hard global per-minute gate."""
+        # Boost feeds call this after taking that source/token's boost lock. The
+        # feed workflow confines the whole path to one token per transaction, and
+        # every boost wake-up takes this global gate before CandidateRepository's
+        # tier-3 and coverage budget locks. No candidate path that owns either
+        # downstream budget lock later requests this gate or another token's feed
+        # enrichment lock, so the nested global lock cannot close a lock cycle.
         await session.execute(
             text("SELECT pg_advisory_xact_lock(:lock_id)"),
             {"lock_id": _BOOST_WAKEUP_BUDGET_LOCK},

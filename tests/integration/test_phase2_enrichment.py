@@ -349,6 +349,201 @@ class _FakeBoostFeed:
         )
 
 
+class _OrderedBoostFeed:
+    def __init__(self, addresses: tuple[str, str]) -> None:
+        self._addresses = addresses
+
+    async def fetch_boost_feed(self, *, feed_kind: str) -> DexScreenerBoostFeedResult:
+        raw = tuple(
+            {
+                "chainId": "solana",
+                "tokenAddress": address,
+                "amount": index,
+                "icon": f"https://example.test/{feed_kind}/{address}.png",
+            }
+            for index, address in enumerate(self._addresses, start=1)
+        )
+        return DexScreenerBoostFeedResult(
+            feed_kind=feed_kind,
+            records=tuple(DexScreenerBoostFeedRecord.model_validate(item) for item in raw),
+            received_at=NOW,
+            raw_response=raw,
+        )
+
+
+class _PauseAfterFirstMetadataLock(TokenMetadataRepository):
+    """Align two feeds after each has persisted and locked a different first token."""
+
+    def __init__(self, own_first_locked: asyncio.Event, other_first_locked: asyncio.Event) -> None:
+        self._own_first_locked = own_first_locked
+        self._other_first_locked = other_first_locked
+        self._calls = 0
+
+    async def record_if_changed(
+        self,
+        session: AsyncSession,
+        *,
+        token_id: uuid.UUID,
+        pair_id: uuid.UUID | None,
+        collector_run_id: uuid.UUID | None,
+        api_request_log_id: uuid.UUID | None,
+        discovery_event_id: uuid.UUID | None,
+        provider: str,
+        source_kind: str,
+        source_observed_at: datetime | None,
+        received_at: datetime,
+        source_record_locator: str,
+        source_record_sha256: str,
+        metadata: MetadataCreate,
+    ) -> TokenMetadataEvent | None:
+        stored = await super().record_if_changed(
+            session,
+            token_id=token_id,
+            pair_id=pair_id,
+            collector_run_id=collector_run_id,
+            api_request_log_id=api_request_log_id,
+            discovery_event_id=discovery_event_id,
+            provider=provider,
+            source_kind=source_kind,
+            source_observed_at=source_observed_at,
+            received_at=received_at,
+            source_record_locator=source_record_locator,
+            source_record_sha256=source_record_sha256,
+            metadata=metadata,
+        )
+        self._calls += 1
+        if self._calls == 1:
+            self._own_first_locked.set()
+            await asyncio.wait_for(self._other_first_locked.wait(), timeout=5)
+        return stored
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_opposite_order_boost_feeds_do_not_accumulate_metadata_locks(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    run_id, _, _ = await _subject(session_factory)
+    addresses = ("phase2-boost-deadlock-a", "phase2-boost-deadlock-b")
+    async with session_factory() as session, session.begin():
+        for address in addresses:
+            await TokenRepository().get_or_create(
+                session,
+                chain="solana",
+                address=address,
+                first_discovered_at=NOW,
+            )
+
+    latest_first_locked = asyncio.Event()
+    top_first_locked = asyncio.Event()
+    latest = BoostCollectionWorkflow(session_factory, _OrderedBoostFeed(addresses))
+    top = BoostCollectionWorkflow(session_factory, _OrderedBoostFeed((addresses[1], addresses[0])))
+    latest._metadata = _PauseAfterFirstMetadataLock(  # noqa: SLF001
+        latest_first_locked, top_first_locked
+    )
+    top._metadata = _PauseAfterFirstMetadataLock(  # noqa: SLF001
+        top_first_locked, latest_first_locked
+    )
+
+    # With one transaction around each complete feed, the gates deterministically
+    # leave latest holding metadata lock A and top holding metadata lock B before
+    # each requests the other's lock. Per-record transactions release both first
+    # locks before either workflow advances to its second token.
+    latest_result, top_result = await asyncio.wait_for(
+        asyncio.gather(
+            latest.collect(feed_kind="latest", collector_run_id=run_id, requested_at=NOW),
+            top.collect(feed_kind="top", collector_run_id=run_id, requested_at=NOW),
+        ),
+        timeout=5,
+    )
+
+    assert latest_result.tracked_records == 2
+    assert top_result.tracked_records == 2
+    async with session_factory() as session:
+        request_count = await session.scalar(select(func.count()).select_from(ApiRequestLog))
+        boost_count = await session.scalar(select(func.count()).select_from(BoostObservation))
+    assert request_count == 3  # Includes the fixture request from _subject().
+    assert boost_count == 4
+
+
+class _FailSecondBoostWakeup:
+    def __init__(self) -> None:
+        self._calls = 0
+
+    async def evaluate_boost_observation_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        boost_observation_id: uuid.UUID,
+        collector_run_id: uuid.UUID,
+    ) -> object:
+        del session, boost_observation_id, collector_run_id
+        self._calls += 1
+        if self._calls == 2:
+            raise RuntimeError("injected second-record normalization failure")
+        return object()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_boost_feed_commits_raw_evidence_before_partial_record_normalization(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    run_id, _, _ = await _subject(session_factory)
+    addresses = ("phase2-boost-partial-a", "phase2-boost-partial-b")
+    async with session_factory() as session, session.begin():
+        for address in addresses:
+            await TokenRepository().get_or_create(
+                session,
+                chain="solana",
+                address=address,
+                first_discovered_at=NOW,
+            )
+
+    workflow = BoostCollectionWorkflow(
+        session_factory,
+        _OrderedBoostFeed(addresses),
+        wakeup_handler=_FailSecondBoostWakeup(),
+    )
+    with pytest.raises(RuntimeError, match="injected second-record normalization failure"):
+        await workflow.collect(feed_kind="latest", collector_run_id=run_id, requested_at=NOW)
+
+    async with session_factory() as session:
+        request = await session.scalar(
+            select(ApiRequestLog).where(ApiRequestLog.endpoint == "/token-boosts/latest/v1")
+        )
+        boosts: list[BoostObservation] = []
+        metadata_count = 0
+        if request is not None:
+            boosts = list(
+                (
+                    await session.execute(
+                        select(BoostObservation).where(
+                            BoostObservation.api_request_log_id == request.id
+                        )
+                    )
+                ).scalars()
+            )
+            metadata_count = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(TokenMetadataEvent)
+                    .where(TokenMetadataEvent.api_request_log_id == request.id)
+                )
+                or 0
+            )
+
+    assert request is not None
+    assert request.response_payload is not None
+    assert len(cast(list[object], request.response_payload["records"])) == 2
+    assert request.request_payload is not None
+    assert request.request_payload["normalization_semantics"] == (
+        "raw_feed_then_per_tracked_record_transactions"
+    )
+    assert len(boosts) == 1
+    assert metadata_count == 1
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_boost_feed_retains_raw_but_does_not_admit_untracked_tokens(

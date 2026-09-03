@@ -77,6 +77,14 @@ already tracked Solana tokens. Do not admit unrelated feed tokens. Feed absence 
 negative fact. Neutral power-of-ten crossings are audit events for query acceleration;
 they carry no UI status or quality meaning and 500 is not encoded as a category.
 
+The raw request envelope commits before normalization. Each tracked feed record then commits
+its boost fact, candidate wake-up, and metadata together in a separate transaction. This avoids
+holding advisory locks for unrelated tokens across an arbitrarily ordered global feed. A failure
+can therefore leave a partially normalized feed: completed records remain immutable and valid,
+the component failure is surfaced, and the complete raw envelope plus stable record locators and
+digests remains durable for audit or replay. The API-request outcome describes the provider
+response, not all-or-nothing downstream normalization.
+
 ### Metadata
 
 Normalize PumpPortal name/symbol/URI at discovery and DEX pair token identity/image/link

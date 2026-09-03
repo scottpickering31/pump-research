@@ -118,9 +118,9 @@ class BoostCollectionWorkflow:
             raise
 
         payload = {"records": list(result.raw_response)}
-        boost_changes = 0
-        metadata_changes = 0
-        tracked_records = 0
+        # The provider request is complete evidence in its own right. Commit it
+        # before normalization so a later per-record failure cannot erase the raw
+        # feed that explains both persisted and not-yet-persisted enrichment.
         async with self._session_factory() as session, session.begin():
             request = await self._requests.record(
                 session,
@@ -135,6 +135,7 @@ class BoostCollectionWorkflow:
                 request_payload={
                     "feed_kind": feed_kind,
                     "coverage_semantics": "bounded_global_feed_not_complete_token_state",
+                    "normalization_semantics": "raw_feed_then_per_tracked_record_transactions",
                     "provider_attempt_count": result.attempt_count,
                 },
                 response_payload=payload,
@@ -146,32 +147,42 @@ class BoostCollectionWorkflow:
                 for record in result.records
                 if record.chain_id == "solana" and record.token_address
             }
-            tokens = (
+            token_rows = (
                 (
                     await session.execute(
-                        select(Token).where(Token.chain == "solana", Token.address.in_(addresses))
+                        select(Token.address, Token.id).where(
+                            Token.chain == "solana", Token.address.in_(addresses)
+                        )
                     )
-                )
-                .scalars()
-                .all()
+                ).all()
                 if addresses
                 else []
             )
-            tokens_by_address = {token.address: token for token in tokens}
-            records = zip(result.records, result.raw_response, strict=True)
-            for index, (record, raw) in enumerate(records):
-                token = tokens_by_address.get(record.token_address or "")
-                if token is None:
-                    continue
-                tracked_records += 1
+            tokens_by_address = {address: token_id for address, token_id in token_rows}
+            request_id = request.id
+
+        boost_changes = 0
+        metadata_changes = 0
+        tracked_records = 0
+        records = zip(result.records, result.raw_response, strict=True)
+        for index, (record, raw) in enumerate(records):
+            token_id = tokens_by_address.get(record.token_address or "")
+            if token_id is None:
+                continue
+            # A feed can overlap another feed in arbitrary token order. Keeping
+            # each tracked record atomic avoids retaining one token's advisory
+            # locks while acquiring another token's locks. If a later record
+            # fails, earlier records remain valid immutable enrichment and the
+            # already-committed raw feed remains available for audit or replay.
+            async with self._session_factory() as session, session.begin():
                 locator = f"records[{index}]"
                 record_sha256 = canonical_digest(raw)
                 boost = await self._boosts.record_if_changed(
                     session,
-                    token_id=token.id,
+                    token_id=token_id,
                     pair_id=None,
                     collector_run_id=collector_run_id,
-                    api_request_log_id=request.id,
+                    api_request_log_id=request_id,
                     provider=DEX_SCREENER_PROVIDER,
                     source_kind=f"{feed_kind}_feed",
                     feed_rank=index + 1,
@@ -181,7 +192,6 @@ class BoostCollectionWorkflow:
                     source_record_sha256=record_sha256,
                     fact=BoostCreate(amount=record.amount, total_amount=record.total_amount),
                 )
-                boost_changes += boost is not None
                 if boost is not None and self._wakeup_handler is not None:
                     await self._wakeup_handler.evaluate_boost_observation_in_session(
                         session,
@@ -190,10 +200,10 @@ class BoostCollectionWorkflow:
                     )
                 metadata = await self._metadata.record_if_changed(
                     session,
-                    token_id=token.id,
+                    token_id=token_id,
                     pair_id=None,
                     collector_run_id=collector_run_id,
-                    api_request_log_id=request.id,
+                    api_request_log_id=request_id,
                     discovery_event_id=None,
                     provider=DEX_SCREENER_PROVIDER,
                     source_kind="boost_feed",
@@ -203,7 +213,9 @@ class BoostCollectionWorkflow:
                     source_record_sha256=record_sha256,
                     metadata=_feed_metadata(record),
                 )
-                metadata_changes += metadata is not None
+            tracked_records += 1
+            boost_changes += boost is not None
+            metadata_changes += metadata is not None
         return BoostCollectionResult(
             feed_kind=feed_kind,
             source_records=len(result.records),
