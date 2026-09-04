@@ -7,7 +7,8 @@ The schema is designed for source provenance and high-volume append-only observa
 - All timestamps are `timestamptz`. Repository writes reject naïve datetimes and normalize aware input to UTC; async database sessions also set PostgreSQL's timezone to UTC.
 - Tokens and pairs are stable identities; static identity attributes are not repeated in observations.
 - `api_request_log`, `discovery_events`, `discovery_connectivity_events`, `observations`, `lifecycle_policies`, `lifecycle_evidence_evaluations`, `lifecycle_events`, scheduler decisions, poll batches, memberships, and outcomes are immutable at the database level. PostgreSQL triggers reject row updates and deletes.
-- `collector_runs` is intentionally mutable only to record the eventual end/status of a process invocation.
+- `collector_runs` is intentionally mutable only for bounded lifecycle transitions: the
+  one-way live-work boundary, heartbeat, and eventual end/status of a process invocation.
 - `dex_availability_tasks` is an intentionally mutable, leased operational projection. Its append-only lifecycle events remain the state-history record.
 - `discovery_checkpoint_states` is a mutable provider-neutral cursor projection advanced only in the transaction that persists its discovery batch.
 - `deduplication_conflicts` is append-only evidence of deliveries rejected by an idempotency constraint; it makes duplicate rates measurable without duplicating every accepted fact.
@@ -26,7 +27,20 @@ One canonical pair per `chain` plus pair `address`, linked to its tracked token 
 
 ### `collector_runs`
 
-Operational provenance for a collector invocation. It records start/end time, status, collector version, and the full immutable configuration snapshot plus SHA-256 digest. `ix_collector_runs_started_at` supports run-history and incident queries. This is not a source-fact table and may be finalized from `running` to a terminal status.
+Operational provenance for a collector invocation. `started_at` records when invocation/startup
+began. Nullable `collection_started_at` records the later instant when startup/reconstruction had
+committed and the runtime was about to permit the live worker to run. It is committed in a separate
+transaction before the worker task is created. A trigger permits only the first `NULL` to timestamp
+transition and rejects replacement or clearing; the repository makes uncertain-commit retries
+idempotent by returning the original timestamp. Historical NULL values are deliberately not
+backfilled and mean that the live boundary is unknown, never that it equals `started_at`.
+
+The table also records end time, heartbeat, status, collector version, and the full immutable
+configuration snapshot plus SHA-256 digest. `ix_collector_runs_started_at` supports run-history and
+incident queries. No index is added for `collection_started_at`: current reporting obtains the small
+run set through the existing epoch foreign-key index, and there is no demonstrated standalone
+live-boundary query requiring additional write overhead. This is not a source-fact table and may be
+finalized from `running` to a terminal status.
 
 ### `collector_run_events`
 

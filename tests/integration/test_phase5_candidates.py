@@ -111,6 +111,9 @@ async def _subject(
             configuration_snapshot={},
             collection_epoch_id=epoch.id,
         )
+        await CollectorRunRepository().mark_collection_started(
+            session, run_id=run.id, collection_started_at=NOW
+        )
         token = await TokenRepository().get_or_create(
             session,
             chain="solana",

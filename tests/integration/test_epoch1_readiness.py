@@ -119,6 +119,9 @@ async def test_failed_run_is_visible_and_invalid_epoch_is_filtered_by_default(
             configuration_snapshot={},
             collection_epoch_id=epoch.id,
         )
+        await CollectorRunRepository().mark_collection_started(
+            session, run_id=run.id, collection_started_at=NOW
+        )
         await CollectorRunRepository().finish(
             session,
             run_id=run.id,
@@ -319,6 +322,9 @@ async def test_storage_archive_analytics_and_backup_are_readable(
             configuration_sha256="a" * 64,
             configuration_snapshot={"test": True},
             collection_epoch_id=epoch.id,
+        )
+        await CollectorRunRepository().mark_collection_started(
+            session, run_id=run.id, collection_started_at=NOW
         )
         token = Token(chain="solana", address="epoch1-token", first_discovered_at=NOW)
         session.add(token)

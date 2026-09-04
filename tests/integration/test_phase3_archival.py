@@ -80,6 +80,9 @@ async def _closed_epoch(
             configuration_snapshot={"phase": 3},
             collection_epoch_id=epoch.id,
         )
+        await CollectorRunRepository().mark_collection_started(
+            session, run_id=run.id, collection_started_at=NOW
+        )
         token = Token(
             chain="solana",
             address=f"phase3-token-{epoch_number}",

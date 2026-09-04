@@ -16,6 +16,7 @@ does not call Pump.fun or DEX Screener.
 | Duplicate API response | Collapses an exact duplicate while retaining unchanged facts from a genuinely later request. |
 | SIGKILL/process restart | Physically kills a real `python -m pump_research collector run` process and leaves its run unfinished. |
 | Restart reconstruction | Replacement recovers the abandoned run and reconstructs tokens, DEX work, schedules, leases, and discovery checkpoint state from PostgreSQL. |
+| Slow or failed startup | Invocation `started_at` precedes reconstruction. A separate `collection_started_at` commits only after successful startup, before any worker task is created; failed initialization leaves no run/live boundary. |
 | SIGINT/SIGTERM | The worker stops accepting new claims, allows bounded in-flight work to finish or cancels after the configured grace period, marks components stopped, appends immutable terminal evidence, and finalizes its run as `stopped`. |
 | Closed `tee` output pipe during Ctrl+C | Structured logging absorbs `EPIPE`; a closed log consumer cannot turn an intentional stop into a component or collector failure. |
 | Stale-running reconciliation | The repair command must both observe a stale heartbeat and acquire the collector's singleton advisory lock. It preserves the last heartbeat, snapshots prior component evidence into an immutable event, and never closes the epoch implicitly. |
@@ -41,3 +42,7 @@ ownership for the process lifetime.
 `collector status` separates `HEALTHY_RUNNING`, `GRACEFULLY_STOPPED`,
 `STALE_OR_CRASHED`, and `FAILED`. An epoch may intentionally remain `running`
 after a graceful collector stop until the operator explicitly closes it.
+
+Status exposes both the invocation and live-work boundaries. Historical runs with a NULL live
+boundary remain explicitly unknown. Continuity calculations use distinct run intervals and never
+count startup/reconstruction time or restart gaps as live-worker uptime.

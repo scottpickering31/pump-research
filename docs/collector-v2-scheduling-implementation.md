@@ -14,6 +14,12 @@ There are three write paths in `scheduling/scheduler.py`:
 2. Batch completion calls `complete_batch_in_session()`. It reads the effective intervals from the capacity decision referenced by the claimed batch, re-evaluates the token's current lifecycle state, and sets `next_due_at = completed_at + effective_interval`. Scheduling from completion rather than the old due time prevents an impossible cadence from accumulating an automatically growing chain of missed obligations.
 3. When an epoch transitions from planned to running, `initialize_epoch_in_session()` rebases every schedule once. It hashes `(epoch_id, token_id)` into a phase within the current effective interval and sets `next_due_at = epoch_started_at + phase`. This prevents a simultaneous restart avalanche at a clean epoch boundary.
 
+`epoch_started_at` in this initialization rule is the lifecycle/invocation timestamp supplied to
+the one-time startup transaction; it is not an observed-coverage boundary. After that transaction
+commits, the runtime separately commits `collector_runs.collection_started_at` and only then creates
+the worker task. Slow reconstruction therefore remains visible as startup time without being counted
+as live-worker coverage.
+
 Reapplying the same lifecycle state under the same scheduler policy returns the existing projection without moving its due time. That prevents repeated evidence from postponing a poll indefinitely. A state change while a batch is in flight is respected at completion because the completion path locks and reads the current schedule.
 
 ### 2. Lifecycle-to-target mapping

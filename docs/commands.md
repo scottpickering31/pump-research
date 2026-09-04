@@ -116,7 +116,7 @@ FROM observations
 ORDER BY received_at DESC
 LIMIT 20;
 
-SELECT id, started_at, finished_at, status, last_heartbeat_at
+SELECT id, started_at, collection_started_at, finished_at, status, last_heartbeat_at
 FROM collector_runs
 ORDER BY started_at DESC
 LIMIT 10;

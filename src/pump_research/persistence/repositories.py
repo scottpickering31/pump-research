@@ -44,6 +44,10 @@ class CollectorRunTerminalConflictError(RuntimeError):
     """One run was presented with conflicting terminal-state evidence."""
 
 
+class CollectorRunNotRunningError(RuntimeError):
+    """A collector-run lifecycle transition targeted a terminal run."""
+
+
 @dataclass(slots=True)
 class _LifecyclePolicyTransactionCache:
     """Policies already verified inside one database transaction."""
@@ -238,6 +242,39 @@ class CollectorRunRepository:
         session.add(run)
         await session.flush()
         return run
+
+    async def mark_collection_started(
+        self,
+        session: AsyncSession,
+        *,
+        run_id: uuid.UUID,
+        collection_started_at: datetime,
+    ) -> datetime:
+        """Durably open the one-way live-work boundary for one running invocation.
+
+        Retrying after an uncertain commit returns the original boundary. The
+        timestamp is never replaced with a later retry time.
+        """
+        normalized_collection_started_at = _normalize_utc(
+            collection_started_at, "collection_started_at"
+        )
+        assert normalized_collection_started_at is not None
+        run = await session.scalar(
+            select(CollectorRun).where(CollectorRun.id == run_id).with_for_update()
+        )
+        if run is None:
+            raise LookupError(f"collector run does not exist: {run_id}")
+        if run.collection_started_at is not None:
+            return run.collection_started_at
+        if run.status != "running":
+            raise CollectorRunNotRunningError(
+                f"collector run {run_id} is {run.status}; live collection cannot begin"
+            )
+        if normalized_collection_started_at < run.started_at:
+            raise ValueError("collection_started_at cannot precede started_at")
+        run.collection_started_at = normalized_collection_started_at
+        await session.flush()
+        return normalized_collection_started_at
 
     async def finish(
         self,

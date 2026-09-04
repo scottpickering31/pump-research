@@ -48,6 +48,13 @@ An observation table alone cannot measure missingness. The system will persist a
 
 Discovery adapters must expose their coverage semantics: cursor/sequence where available, checkpoint time, reconnect boundaries, backfill support, and detected discontinuities. A checkpoint cannot advance past an event until the event is durably stored. If a provider cannot prove completeness, reports must state that limitation rather than imply full discovery coverage.
 
+Collector lifecycle time is distinct from live-work time. A run's `started_at` records invocation
+and startup beginning; its nullable `collection_started_at` records that reconstruction committed and
+the worker may begin. Epoch lifecycle `started_at` is likewise not source-coverage evidence. Epoch
+live intervals are derived from individual run boundaries, retaining restart gaps. A NULL historical
+boundary is unknown, and even a known boundary proves only worker permission: first source evidence
+may arrive later and source-specific coverage still depends on durable discovery/API evidence.
+
 Daily data-quality reports can then compare due work with completed outcomes, quantify lateness and scheduler lag, report API and database failures, identify sequence/cursor gaps, and distinguish provider-empty results from collector gaps.
 
 ## Restart and idempotency model

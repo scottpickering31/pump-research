@@ -79,6 +79,19 @@ async def read_collector_status(
             .limit(1)
         )
         epoch_row = (await session.execute(epoch_statement)).one_or_none()
+        epoch_collection_started_at: datetime | None = None
+        epoch_unknown_collection_boundaries = 0
+        if epoch_row is not None:
+            epoch_boundary_row = (
+                await session.execute(
+                    select(
+                        func.min(CollectorRun.collection_started_at),
+                        func.count().filter(CollectorRun.collection_started_at.is_(None)),
+                    ).where(CollectorRun.collection_epoch_id == epoch_row[0].id)
+                )
+            ).one()
+            epoch_collection_started_at = epoch_boundary_row[0]
+            epoch_unknown_collection_boundaries = int(epoch_boundary_row[1] or 0)
         health_rows = (
             []
             if latest is None
@@ -490,13 +503,23 @@ async def read_collector_status(
     else:
         run_lifecycle = "UNKNOWN"
     actively_collecting = operational_state == "HEALTHY"
-    continuity_warning = (
-        "epoch is marked running but its latest collector run is not healthy"
-        if epoch_current is not None
+    if (
+        epoch_current is not None
+        and epoch_current.status == "running"
+        and latest is not None
+        and latest.collection_started_at is None
+    ):
+        continuity_warning = (
+            "latest collector run has no durable collection_started_at; live boundary is unknown"
+        )
+    elif (
+        epoch_current is not None
         and epoch_current.status == "running"
         and not actively_collecting
-        else None
-    )
+    ):
+        continuity_warning = "epoch is marked running but its latest collector run is not healthy"
+    else:
+        continuity_warning = None
     return {
         "checked_at": now.isoformat(),
         "operational_state": operational_state,
@@ -509,6 +532,14 @@ async def read_collector_status(
             "id": str(latest.id),
             "status": latest.status,
             "started_at": latest.started_at.isoformat(),
+            "collection_started_at": (
+                latest.collection_started_at.isoformat()
+                if latest.collection_started_at is not None
+                else None
+            ),
+            "collection_start_boundary_status": (
+                "known" if latest.collection_started_at is not None else "unknown"
+            ),
             "finished_at": latest.finished_at.isoformat() if latest.finished_at else None,
             "last_heartbeat_at": (
                 latest.last_heartbeat_at.isoformat() if latest.last_heartbeat_at else None
@@ -521,6 +552,21 @@ async def read_collector_status(
             "uptime_seconds": max(
                 0, int(((latest.finished_at or now) - latest.started_at).total_seconds())
             ),
+            "invocation_uptime_seconds": max(
+                0, int(((latest.finished_at or now) - latest.started_at).total_seconds())
+            ),
+            "live_collection_uptime_seconds": (
+                None
+                if latest.collection_started_at is None
+                else max(
+                    0,
+                    int(
+                        (
+                            (latest.finished_at or now) - latest.collection_started_at
+                        ).total_seconds()
+                    ),
+                )
+            ),
         },
         "collection_epoch": None
         if epoch is None or epoch_current is None
@@ -531,6 +577,19 @@ async def read_collector_status(
             "started_at": (
                 epoch_current.started_at.isoformat() if epoch_current.started_at else None
             ),
+            "effective_collection_started_at": (
+                epoch_collection_started_at.isoformat()
+                if epoch_collection_started_at is not None
+                else None
+            ),
+            "collection_start_boundary_status": (
+                "unknown"
+                if epoch_unknown_collection_boundaries
+                else "known"
+                if epoch_collection_started_at is not None
+                else "not_started"
+            ),
+            "unknown_collection_start_run_count": epoch_unknown_collection_boundaries,
             "ended_at": epoch_current.ended_at.isoformat() if epoch_current.ended_at else None,
             "data_valid": epoch_current.data_valid,
             "invalid_reason": epoch_current.invalid_reason,

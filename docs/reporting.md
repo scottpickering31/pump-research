@@ -19,6 +19,14 @@ poll-claim times, not on assumed request completion. Expected cadence is read
 from the immutable scheduler configuration snapshot attached to each claimed
 batch.
 
+For an epoch-scoped report, the window begins at the earliest known run
+`collection_started_at`, not at epoch lifecycle `started_at`. Validation output lists each run's
+clipped live interval, sums only their union, and exposes gaps between restarts. Every run must have
+a known live boundary; historical NULL values fail the epoch report rather than silently counting
+startup as coverage. The boundary means the worker was permitted to start. PumpPortal discovery and
+DEX/API coverage still require their own durable events and attempts, whose first timestamps may be
+slightly later.
+
 Duplicate rate is based on an append-only collision ledger: a duplicate is a
 delivery rejected by a durable idempotency constraint. The denominator is
 accepted discovery/request/observation facts plus recorded duplicate deliveries.

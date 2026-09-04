@@ -21,6 +21,7 @@ from pump_research.research.sources import (
     HotColdResearchSource,
     InMemoryResearchSource,
     PostgresResearchSource,
+    ResearchCoverageUnknownError,
 )
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "LabelSetContract",
     "LabelResult",
     "PostgresResearchSource",
+    "ResearchCoverageUnknownError",
     "TokenHistory",
     "TokenStateAsOf",
     "build_dataset",

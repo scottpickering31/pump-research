@@ -51,9 +51,25 @@ identifier.
 | context `bucket_start` / `bucket_end` | fixed UTC source window | window semantics; not availability |
 | context `source_observed_at` | closed-bucket cutoff (`bucket_end`) | descriptive/validation |
 | context `received_at` | derivation completion/receipt | canonical availability, also require closed bucket |
-| epoch/run `created_at` / `started_at` | declaration / invocation start | available at the recorded time |
+| epoch `created_at`; epoch-current `started_at` | declaration / lifecycle transition to running | provenance only; not proof of live source coverage |
+| run `started_at` | collector invocation/startup began | invocation provenance only |
+| run `collection_started_at` | startup committed; runtime may now start its live worker | earliest possible live work for that run; not source-connection proof |
 | epoch/run events `occurred_at` | immutable operational transition | canonical transition availability |
 | all `persisted_at` | database insertion time | durable audit and anomaly check |
+
+### Run/epoch boundary consumer audit
+
+| Code path | Classification and rule |
+|---|---|
+| epoch create/start/list/status/close | lifecycle provenance; keep epoch-current `started_at` |
+| scheduler epoch initialization | operational lifecycle anchor for deterministic rebase; keep epoch `started_at`, with no coverage claim |
+| stale-run recovery and latest-run ordering | invocation/process provenance; keep run `started_at` |
+| collector status | latest-run ordering and invocation uptime use `started_at`; display `collection_started_at` and live uptime separately |
+| archive eligibility, sizing, and `collector_runs` export | epoch/run provenance scope; keep lifecycle/run `started_at`; archived run rows carry the separate live boundary |
+| epoch-scoped 24-hour report and continuity diagnostics | actual live-window calculation; use each run's `collection_started_at`, fail on NULL, and retain inter-run gaps |
+| candidate epoch simulation rate denominator | actual live-window calculation; sum known run intervals and retain gaps; fail on NULL |
+| PostgreSQL/Parquet research sources and dataset descriptors | actual live-window provenance; require known run boundaries and preserve every interval |
+| source-specific discovery/API coverage | use immutable source events, connectivity evidence, attempts, and responses; neither start field proves coverage |
 
 ## Identity, admission, and pair selection
 
@@ -100,6 +116,14 @@ Qenis is available as a valid Epoch 2 case study. The explosive 24iu segment is 
 Epoch 1; Epoch 2 has 68 later observations around $261–266 market cap and $507–515
 liquidity. Phase 4 uses that as a negative validity/leakage test and does not splice the
 invalid move into Epoch 2 labels.
+
+Canonical PostgreSQL and archive research adapters require a known
+`collection_started_at` for every run in the selected epoch. A historical NULL fails closed as an
+unknown coverage boundary; it is never replaced with run or epoch `started_at`. Dataset source
+descriptors retain each distinct run interval. Restarts therefore do not collapse intervening gaps
+into continuous coverage. The first durable discovery event or API request may be slightly later
+than `collection_started_at`, and source-specific completeness remains governed by durable source
+events, requests, checkpoints, and connectivity evidence—not by the live-work boundary alone.
 
 ## Leakage threats
 

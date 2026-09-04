@@ -85,6 +85,9 @@ async def _seed_closed_epoch(session_factory: async_sessionmaker[AsyncSession]) 
             configuration_snapshot={"phase": 4},
             collection_epoch_id=epoch.id,
         )
+        await CollectorRunRepository().mark_collection_started(
+            session, run_id=run.id, collection_started_at=NOW
+        )
         token = Token(chain="solana", address="phase4-token")
         session.add(token)
         await session.flush()

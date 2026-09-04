@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +13,12 @@ from typing import Any
 from sqlalchemy import case, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from pump_research.collection.boundaries import (
+    live_collection_intervals,
+    live_seconds,
+    load_run_boundaries,
+    require_known_collection_boundary,
+)
 from pump_research.epochs import get_epoch_status
 from pump_research.persistence.models import (
     ApiRequestLog,
@@ -71,13 +78,16 @@ async def generate_report(
     deliberately not used for historical metrics.
     """
     epoch_metadata: dict[str, object] | None = None
-    epoch_id = None
+    epoch_id: uuid.UUID | None = None
     if epoch_number is None:
         report_end = _normalise_end_at(end_at)
         report_start = report_end - timedelta(hours=_HOURS)
     else:
         async with session_factory() as epoch_session:
             epoch = await get_epoch_status(epoch_session, epoch_number)
+            epoch_run_boundaries = await load_run_boundaries(
+                epoch_session, collection_epoch_id=epoch.id
+            )
         if epoch.started_at is None:
             raise ValueError(f"epoch {epoch_number} has not started")
         if not epoch.data_valid and not include_invalid:
@@ -85,7 +95,14 @@ async def generate_report(
                 f"epoch {epoch_number} is invalid and excluded from research reports by default; "
                 "set include_invalid=True for explicit engineering analysis"
             )
-        report_start = epoch.started_at
+        require_known_collection_boundary(
+            epoch_run_boundaries, context=f"epoch {epoch_number} research report"
+        )
+        report_start = min(
+            boundary.collection_started_at
+            for boundary in epoch_run_boundaries
+            if boundary.collection_started_at is not None
+        )
         requested_end = (
             _aware_utc(end_at, "end_at")
             if end_at is not None
@@ -546,7 +563,7 @@ async def _largest_poll_gaps(
 async def _validation_summary(
     session: AsyncSession,
     *,
-    epoch_id: object | None,
+    epoch_id: uuid.UUID | None,
     start: datetime,
     end: datetime,
 ) -> dict[str, object]:
@@ -574,7 +591,8 @@ async def _validation_summary(
               AND ar.requested_at >= :start AND ar.requested_at < :end
             LEFT JOIN observations o ON o.api_request_log_id = ar.id
             WHERE {run_filter}
-              AND cr.started_at < :end
+              AND cr.collection_started_at IS NOT NULL
+              AND cr.collection_started_at < :end
               AND COALESCE(cr.finished_at, :end) >= :start
             """),
                 parameters,
@@ -897,7 +915,22 @@ async def _validation_summary(
         .mappings()
         .one()
     )
-    duration_seconds = max(1.0, (end - start).total_seconds())
+    all_boundaries = await load_run_boundaries(session, collection_epoch_id=epoch_id)
+    scoped_boundaries = tuple(
+        boundary
+        for boundary in all_boundaries
+        if boundary.started_at < end
+        and (boundary.finished_at or end) >= start
+    )
+    unknown_boundary_run_ids = tuple(
+        boundary.run_id
+        for boundary in scoped_boundaries
+        if boundary.collection_started_at is None
+    )
+    intervals = live_collection_intervals(scoped_boundaries, start=start, end=end)
+    collection_boundary_known = bool(scoped_boundaries) and not unknown_boundary_run_ids
+    live_duration_seconds = live_seconds(intervals) if collection_boundary_known else None
+    scope_duration_seconds = max(1.0, (end - start).total_seconds())
     total_calls = int(api["total_calls"] or 0)
     growth = int(storage["growth_bytes"] or 0)
     gib = 1024**3
@@ -906,13 +939,38 @@ async def _validation_summary(
             **_json_mapping(collection),
             "start": start.isoformat(),
             "end_exclusive": end.isoformat(),
-            "uptime_window_seconds": duration_seconds,
+            "uptime_window_seconds": live_duration_seconds,
+            "scope_window_seconds": scope_duration_seconds,
+            "collection_start_boundary_status": (
+                "known" if collection_boundary_known else "unknown"
+            ),
+            "unknown_collection_start_run_ids": [
+                str(run_id) for run_id in unknown_boundary_run_ids
+            ],
+            "live_run_intervals": [
+                {
+                    "collector_run_id": str(interval.run_id),
+                    "start": interval.start.isoformat(),
+                    "end_exclusive": interval.end.isoformat(),
+                    "duration_seconds": interval.duration_seconds,
+                }
+                for interval in intervals
+            ],
+            "non_live_gap_seconds": (
+                None
+                if live_duration_seconds is None
+                else max(0.0, scope_duration_seconds - live_duration_seconds)
+            ),
             "pending_dex_at_report_generation": pending_dex,
             "discovery_connectivity_gap_seconds": connectivity_gap_seconds,
             "discovery_connectivity_uptime_pct": round(
-                100.0 * max(0.0, duration_seconds - connectivity_gap_seconds) / duration_seconds,
+                100.0
+                * max(0.0, live_duration_seconds - connectivity_gap_seconds)
+                / max(1.0, live_duration_seconds),
                 6,
-            ),
+            )
+            if live_duration_seconds is not None
+            else None,
         },
         "scheduler": {
             "capacity_mode_over_time": [_json_mapping(row) for row in capacity],
@@ -926,7 +984,11 @@ async def _validation_summary(
         "api": {
             **_json_mapping(api),
             "outcomes": {str(name): int(count) for name, count in outcomes},
-            "average_requests_per_minute": round(total_calls / (duration_seconds / 60), 6),
+            "average_requests_per_minute": (
+                round(total_calls / (live_duration_seconds / 60), 6)
+                if live_duration_seconds
+                else None
+            ),
             "peak_requests_per_minute": peak_requests_per_minute,
             "peak_request_headroom": (
                 None
@@ -946,9 +1008,17 @@ async def _validation_summary(
         "dataset": _json_mapping(dataset),
         "storage": {
             **_json_mapping(storage),
-            "actual_gib_per_day_extrapolation": round(growth * 86_400 / duration_seconds / gib, 6),
+            "actual_gib_per_day_extrapolation": (
+                round(growth * 86_400 / live_duration_seconds / gib, 6)
+                if live_duration_seconds
+                else None
+            ),
             "hot_postgres_projection_gib": {
-                str(days): round(growth * 86_400 / duration_seconds * days / gib, 6)
+                str(days): (
+                    round(growth * 86_400 / live_duration_seconds * days / gib, 6)
+                    if live_duration_seconds
+                    else None
+                )
                 for days in (30, 90, 365)
             },
             "projection_label": "extrapolation from epoch storage samples",

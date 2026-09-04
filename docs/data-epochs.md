@@ -31,8 +31,11 @@ verified, and backup verification is reported independently.
 - Initial intended duration: 24 hours.
 - Initial status: planned; it must be created explicitly.
 - It starts only after the Epoch 1 readiness safeguards and quality gates pass.
-- Its exact UTC start is the durable `running` epoch event written in the same
-  startup transaction as the first collector run.
+- Its exact UTC lifecycle start is the durable `running` epoch event written in the same
+  startup transaction as the first collector run. This is not proof of live collection.
+- Effective live-work intervals are derived from each run's separately committed
+  `collection_started_at`; restart gaps remain gaps and source-specific coverage requires source
+  evidence.
 - Restarts remain inside Epoch 1 and do not change its original start time.
 - It ends only through an explicit epoch close command after the collector has
   stopped.

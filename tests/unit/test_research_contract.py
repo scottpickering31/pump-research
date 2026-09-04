@@ -451,6 +451,15 @@ def _write_cold_fixture(
             ):
                 row.pop(column)
     files = {
+        "collector_runs": [
+            {
+                "id": "00000000-0000-0000-0000-000000000002",
+                "started_at": T0,
+                "collection_started_at": T0,
+                "finished_at": T0 + timedelta(days=30),
+                "status": "stopped",
+            }
+        ],
         "tokens": [{"id": history.token_id, "chain": history.chain, "address": history.address}],
         "pairs": [
             {

@@ -173,6 +173,10 @@ class CollectorRun(Base):
             "status IN ('running', 'stopped', 'succeeded', 'failed', 'cancelled')",
             name="ck_collector_runs_status",
         ),
+        CheckConstraint(
+            "collection_started_at IS NULL OR collection_started_at >= started_at",
+            name="ck_collector_runs_collection_started_after_invocation",
+        ),
         Index("ix_collector_runs_started_at", "started_at"),
         Index("ix_collector_runs_collection_epoch_id", "collection_epoch_id"),
     )
@@ -184,6 +188,7 @@ class CollectorRun(Base):
         nullable=False,
     )
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    collection_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(16), nullable=False)

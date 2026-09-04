@@ -7,7 +7,7 @@ import hashlib
 import json
 import signal
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -57,6 +57,7 @@ class CollectorStartup:
     collection_epoch_id: uuid.UUID
     epoch_number: int
     state: ReconstructedCollectorState
+    collection_started_at: datetime | None = None
 
 
 class CollectorWorkerProtocol(Protocol):
@@ -181,12 +182,26 @@ class CollectorRuntime:
     async def _run_until_stopped_locked(self) -> CollectorStartup:
         """Run while holding the session-level singleton lock."""
         startup = await self.start()
+        try:
+            collection_started_at = await self._mark_collection_started(startup.run_id)
+        except BaseException as boundary_error:
+            await self._finish(
+                startup.run_id,
+                status="failed",
+                failure_detail={
+                    "reason": "collection_start_boundary_persistence_failed",
+                    "error_type": type(boundary_error).__name__,
+                },
+            )
+            raise
+        startup = replace(startup, collection_started_at=collection_started_at)
         installed_signals = self._install_signal_handlers()
         self._logger.info(
             "collector_started",
             run_id=str(startup.run_id),
             collection_epoch_id=str(startup.collection_epoch_id),
             epoch_number=startup.epoch_number,
+            collection_started_at=collection_started_at.isoformat(),
             reconstructed_state=asdict(startup.state),
         )
         worker = self._worker
@@ -208,13 +223,13 @@ class CollectorRuntime:
                 wait_set.add(worker_task)
             done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
             if not self._shutdown.is_set() and worker_task is not None and worker_task in done:
-                error = worker_task.exception()
-                if error is not None:
+                worker_error = worker_task.exception()
+                if worker_error is not None:
                     terminal_detail = {
                         "reason": "collector_worker_failed",
-                        "error_type": type(error).__name__,
+                        "error_type": type(worker_error).__name__,
                     }
-                    pending_error = error
+                    pending_error = worker_error
                 else:
                     terminal_detail = {"reason": "collector_worker_stopped_unexpectedly"}
                     pending_error = RuntimeError(
@@ -280,6 +295,16 @@ class CollectorRuntime:
             raise pending_error
         self._logger.info("collector_stopped", run_id=str(startup.run_id), **terminal_detail)
         return startup
+
+    async def _mark_collection_started(self, run_id: uuid.UUID) -> datetime:
+        """Commit the live-work gate before any worker task can be created."""
+        boundary = datetime.now(UTC)
+        async with self._session_factory() as session, session.begin():
+            return await self._run_repository.mark_collection_started(
+                session,
+                run_id=run_id,
+                collection_started_at=boundary,
+            )
 
     async def _acquire_process_lock(self) -> AsyncConnection:
         return await acquire_collector_process_lock(self._session_factory)

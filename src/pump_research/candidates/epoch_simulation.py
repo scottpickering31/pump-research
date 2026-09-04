@@ -15,6 +15,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from pump_research.candidates.policy import CandidatePolicy
+from pump_research.collection.boundaries import (
+    live_collection_intervals,
+    live_seconds,
+    load_run_boundaries,
+    require_known_collection_boundary,
+)
 from pump_research.config import get_settings
 from pump_research.database import create_database_engine
 
@@ -69,7 +75,7 @@ async def simulate_epoch(
         bounds = (
             await session.execute(
                 text("""
-                SELECT ec.started_at,ec.ended_at
+                SELECT e.id,ec.ended_at
                 FROM collection_epochs e JOIN collection_epoch_current ec
                   ON ec.collection_epoch_id=e.id
                 WHERE e.epoch_number=:epoch
@@ -77,9 +83,24 @@ async def simulate_epoch(
                 {"epoch": epoch_number},
             )
         ).one()
+        boundaries = await load_run_boundaries(session, collection_epoch_id=bounds.id)
+        require_known_collection_boundary(
+            boundaries, context=f"epoch {epoch_number} candidate simulation"
+        )
+        if bounds.ended_at is None:
+            raise ValueError(f"epoch {epoch_number} has not ended")
+        intervals = live_collection_intervals(
+            boundaries,
+            start=min(
+                boundary.collection_started_at
+                for boundary in boundaries
+                if boundary.collection_started_at is not None
+            ),
+            end=bounds.ended_at,
+        )
         stream = await session.stream(query, {"epoch": epoch_number})
         simulation = await _simulate_rows(stream, policy, epoch_number=epoch_number)
-    duration_minutes = max(1.0, (bounds.ended_at - bounds.started_at).total_seconds() / 60)
+    duration_minutes = max(1.0, live_seconds(intervals) / 60)
     return HistoricalCandidateSimulation(
         **{
             **asdict(simulation),

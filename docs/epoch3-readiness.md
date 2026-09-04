@@ -138,9 +138,10 @@ commit. Do not combine steps into an unattended script.
       2>&1 | tee -a logs/epoch3/collector.log
     ```
 
-    Epoch start, scheduler reconstruction, and run creation are one transaction before providers
-    begin. Allow 15 minutes for the one-time 58.9k-schedule audit write. If it fails, no partial
-    epoch-start projection should commit.
+    Epoch start, scheduler reconstruction, and run creation are one transaction. After it commits,
+    the runtime commits the run's `collection_started_at` in a separate short transaction before it
+    creates any provider worker. Allow 15 minutes for the one-time 58.9k-schedule audit write. If it
+    fails, no partial epoch-start projection or live boundary should commit.
 
 15. In another terminal, capture `collector status` at 1, 10, and 30 minutes, 2 hours, and 24 hours.
     At the first sample require zero legacy-unmapped schedules, no leases left from initialization,
@@ -177,4 +178,3 @@ and explicitly abort/invalid the validation only when continuity/provenance requ
 - Acceptance-test a private Solana RPC for basic security and top-holder calls.
 - Establish and verify a physically/provider-independent archive target.
 - Repeat backup restore and hot/cold market/security checksum equivalence on the full scope.
-

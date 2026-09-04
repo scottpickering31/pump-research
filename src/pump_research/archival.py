@@ -493,6 +493,7 @@ _SPECS = (
           AND cr.started_at < :end_at
         ORDER BY cr.started_at, cr.id""",
         mode="scope",
+        archive_schema_version=2,
     ),
     _ExportSpec(
         "collection_epochs",

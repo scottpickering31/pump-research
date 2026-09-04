@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
@@ -18,6 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from pump_research.archival import verify_archive
 from pump_research.archive_analytics import ColdArchiveQuery
+from pump_research.collection.boundaries import (
+    CollectionBoundaryUnknownError,
+    CollectorRunBoundary,
+    load_run_boundaries,
+    require_known_collection_boundary,
+)
 from pump_research.research.contracts import (
     BoostFact,
     CandidateFact,
@@ -47,6 +54,10 @@ class ResearchSource(Protocol):
         end_at: datetime | None = None,
         allow_invalid_epoch: bool = False,
     ) -> tuple[TokenHistory, ...]: ...
+
+
+class ResearchCoverageUnknownError(RuntimeError):
+    """Canonical research was requested for an unknown live collection boundary."""
 
 
 class InMemoryResearchSource:
@@ -171,6 +182,9 @@ class DuckDBArchiveResearchSource:
                 ),
                 "manifest_sha256": sorted(_sha256_file(path) for path in self._manifest_paths),
             }
+            boundaries = _duckdb_run_boundaries(archive.connection)
+            _require_research_boundaries(boundaries, context=f"epoch {epoch_number} archive")
+            descriptor["collection_run_boundaries"] = _boundary_descriptor(boundaries)
             return _histories_from_duckdb(
                 archive.connection,
                 archive.files_by_family,
@@ -220,6 +234,10 @@ class PostgresResearchSource:
                 return ()
             if not bool(epoch["data_valid"]) and not allow_invalid_epoch:
                 return ()
+            boundaries = await load_run_boundaries(
+                session, collection_epoch_id=uuid.UUID(cast(str, epoch["epoch_id"]))
+            )
+            _require_research_boundaries(boundaries, context=f"epoch {epoch_number} PostgreSQL")
             descriptor = {
                 "kind": "postgresql",
                 "schema_revision": await session.scalar(
@@ -227,6 +245,7 @@ class PostgresResearchSource:
                 ),
                 "epoch": epoch_number,
                 "read_only": True,
+                "collection_run_boundaries": _boundary_descriptor(boundaries),
             }
             rows = await _postgres_rows(
                 session,
@@ -243,6 +262,72 @@ class PostgresResearchSource:
             epoch_valid=bool(epoch["data_valid"]),
             descriptor=descriptor,
         )
+
+
+def _require_research_boundaries(
+    boundaries: tuple[CollectorRunBoundary, ...], *, context: str
+) -> None:
+    try:
+        require_known_collection_boundary(boundaries, context=context)
+    except CollectionBoundaryUnknownError as error:
+        raise ResearchCoverageUnknownError(str(error)) from error
+
+
+def _boundary_descriptor(
+    boundaries: tuple[CollectorRunBoundary, ...],
+) -> dict[str, object]:
+    return {
+        "status": "known",
+        "semantics": "worker live-work permission; source coverage requires source evidence",
+        "runs": [
+            {
+                "collector_run_id": str(boundary.run_id),
+                "invocation_started_at": boundary.started_at.isoformat(),
+                "collection_started_at": (
+                    boundary.collection_started_at.isoformat()
+                    if boundary.collection_started_at is not None
+                    else None
+                ),
+                "finished_at": (
+                    boundary.finished_at.isoformat() if boundary.finished_at is not None else None
+                ),
+                "status": boundary.status,
+            }
+            for boundary in boundaries
+        ],
+    }
+
+
+def _duckdb_run_boundaries(
+    connection: duckdb.DuckDBPyConnection,
+) -> tuple[CollectorRunBoundary, ...]:
+    try:
+        columns = _duck_columns(connection, "collector_runs")
+    except duckdb.Error as error:
+        raise ResearchCoverageUnknownError(
+            "archive has no collector_runs live-boundary evidence"
+        ) from error
+    if "collection_started_at" not in columns:
+        raise ResearchCoverageUnknownError(
+            "archive collector_runs predate collection_started_at; live boundary is unknown"
+        )
+    rows = connection.execute(
+        "SELECT id::VARCHAR,started_at::VARCHAR,collection_started_at::VARCHAR,"
+        "finished_at::VARCHAR,status "
+        "FROM collector_runs ORDER BY started_at,id"
+    ).fetchall()
+    return tuple(
+        CollectorRunBoundary(
+            run_id=uuid.UUID(str(row[0])),
+            started_at=_dt(row[1]),
+            collection_started_at=(
+                _dt(row[2]) if row[2] is not None else None
+            ),
+            finished_at=_dt(row[3]) if row[3] is not None else None,
+            status=str(row[4]),
+        )
+        for row in rows
+    )
 
 
 async def _load_both(
