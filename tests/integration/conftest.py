@@ -95,7 +95,7 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
                     "dex_availability_tasks, discovery_checkpoint_states, "
                     "discovery_connectivity_events, "
                     "lifecycle_evidence_evaluations, lifecycle_policies, observations, "
-                    "lifecycle_events, discovery_events, "
+                    "lifecycle_events, discovery_events, discovery_rejected_messages, "
                     "api_request_log, pairs, tokens, collector_run_events, collector_runs, "
                     "collection_epoch_current, collection_epoch_events, collection_epochs CASCADE"
                 )

@@ -34,8 +34,10 @@ from pump_research.discovery.contracts import (
     DiscoveryCoverageStatus,
     DiscoveryResponseParseError,
     DiscoverySourceError,
+    RejectedDiscoveryMessage,
     TokenDiscoverySource,
 )
+from pump_research.discovery.payload_safety import postgres_json_string_failure
 
 PUMPPORTAL_SOURCE_NAME = "pumpportal"
 _SUBSCRIBE_NEW_TOKEN = json.dumps({"method": "subscribeNewToken"}, separators=(",", ":"))
@@ -102,7 +104,20 @@ class _FailureEnvelope:
     error: DiscoveryResponseParseError
 
 
-type _Envelope = _TokenEnvelope | _ConnectivityEnvelope | _FailureEnvelope
+@dataclass(frozen=True, slots=True)
+class _RejectedEnvelope:
+    event: RejectedDiscoveryMessage
+
+
+class _UnsafePayloadError(DiscoveryResponseParseError):
+    """Carry one lossless quarantine record to the reader's local boundary."""
+
+    def __init__(self, event: RejectedDiscoveryMessage) -> None:
+        super().__init__(event.reason_code)
+        self.event = event
+
+
+type _Envelope = _TokenEnvelope | _ConnectivityEnvelope | _FailureEnvelope | _RejectedEnvelope
 
 
 class PumpPortalDiscoverySource(TokenDiscoverySource):
@@ -173,6 +188,7 @@ class PumpPortalDiscoverySource(TokenDiscoverySource):
 
         events: list[DiscoveredToken] = []
         connectivity_events: list[DiscoveryConnectivityEvent] = []
+        rejected_messages: list[RejectedDiscoveryMessage] = []
         envelopes = [first]
         for _ in range(self._settings.pumpportal_batch_size - 1):
             envelope = self._next_envelope_nowait()
@@ -182,21 +198,24 @@ class PumpPortalDiscoverySource(TokenDiscoverySource):
 
         for index, envelope in enumerate(envelopes):
             if isinstance(envelope, _FailureEnvelope):
-                if events or connectivity_events:
+                if events or connectivity_events or rejected_messages:
                     self._deferred.extendleft(reversed(envelopes[index:]))
                     break
                 self._deferred.extendleft(reversed(envelopes[index + 1 :]))
                 raise envelope.error
             if isinstance(envelope, _TokenEnvelope):
                 events.append(envelope.event)
+            elif isinstance(envelope, _RejectedEnvelope):
+                rejected_messages.append(envelope.event)
             else:
                 connectivity_events.append(envelope.event)
 
         batch = self._batch(
             events=tuple(events),
             connectivity_events=tuple(connectivity_events),
+            rejected_messages=tuple(rejected_messages),
         )
-        if batch.events or batch.connectivity_events:
+        if batch.events or batch.connectivity_events or batch.rejected_messages:
             self._unacknowledged_batch = batch
         return batch
 
@@ -269,10 +288,12 @@ class PumpPortalDiscoverySource(TokenDiscoverySource):
         *,
         events: tuple[DiscoveredToken, ...],
         connectivity_events: tuple[DiscoveryConnectivityEvent, ...],
+        rejected_messages: tuple[RejectedDiscoveryMessage, ...] = (),
     ) -> DiscoveryBatch:
         return DiscoveryBatch(
             events=events,
             connectivity_events=connectivity_events,
+            rejected_messages=rejected_messages,
             received_at=self._now(),
             coverage=DiscoveryCoverage(
                 status=DiscoveryCoverageStatus.BEST_EFFORT,
@@ -314,6 +335,15 @@ class PumpPortalDiscoverySource(TokenDiscoverySource):
                         self.metrics.messages_received += 1
                         try:
                             event = _parse_new_token_message(raw_message, received_at=received_at)
+                        except _UnsafePayloadError as error:
+                            self.metrics.parse_failures += 1
+                            await self._queue.put(_RejectedEnvelope(error.event))
+                            self._logger.warning(
+                                "pumpportal_discovery_message_quarantined",
+                                reason_code=error.event.reason_code,
+                                raw_message_sha256=error.event.raw_message_sha256,
+                            )
+                            continue
                         except DiscoveryResponseParseError as error:
                             self.metrics.parse_failures += 1
                             await self._queue.put(_FailureEnvelope(error))
@@ -391,7 +421,7 @@ def _default_connection_factory(
 ) -> AbstractAsyncContextManager[PumpPortalWebSocket]:
     return cast(
         "AbstractAsyncContextManager[PumpPortalWebSocket]",
-        connect(url, max_queue=max_queue, open_timeout=open_timeout),
+        connect(url, max_queue=max_queue, open_timeout=open_timeout, max_size=1_048_576),
     )
 
 
@@ -418,6 +448,31 @@ def _parse_new_token_message(
         raise DiscoveryResponseParseError("PumpPortal returned invalid JSON") from error
     if not isinstance(payload, dict):
         raise DiscoveryResponseParseError("PumpPortal message must be a JSON object")
+
+    # Check the whole payload before extracting *any* normalized text, even mint
+    # and signature. Escaping JSON for transmission does not make NUL JSONB-safe.
+    reason = postgres_json_string_failure(payload)
+    if reason is not None:
+        raw_bytes = (
+            raw_message
+            if isinstance(raw_message, bytes)
+            else raw_message.encode("utf-8", errors="surrogatepass")
+        )
+        raw_digest = hashlib.sha256(raw_bytes).hexdigest()
+        encoding = "binary" if isinstance(raw_message, bytes) else "utf8-surrogatepass"
+        key = f"{PUMPPORTAL_SOURCE_NAME}:rejected:{received_at.isoformat()}:{encoding}:{raw_digest}"
+        raise _UnsafePayloadError(
+            RejectedDiscoveryMessage(
+                source_name=PUMPPORTAL_SOURCE_NAME,
+                endpoint="websocket:subscribeNewToken",
+                received_at=received_at,
+                reason_code=reason,
+                raw_message=raw_bytes,
+                message_encoding=encoding,
+                raw_message_sha256=raw_digest,
+                idempotency_key=hashlib.sha256(key.encode()).hexdigest(),
+            )
+        )
 
     acknowledgement = payload.get("message")
     if (

@@ -107,6 +107,25 @@ class DiscoveryConnectivityEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class RejectedDiscoveryMessage:
+    """An individual source message retained without admitting normalized data.
+
+    ``raw_message`` is the original binary message or UTF-8 (surrogatepass) of a
+    text message. Its SHA-256 is over those bytes, not canonical parsed JSON.
+    ``message_encoding`` distinguishes the two representations for recovery.
+    """
+
+    source_name: str
+    endpoint: str
+    received_at: datetime
+    reason_code: str
+    raw_message: bytes
+    message_encoding: str
+    raw_message_sha256: str
+    idempotency_key: str
+
+
+@dataclass(frozen=True, slots=True)
 class DiscoveryBatch:
     """The result of one source poll, including its data-quality semantics."""
 
@@ -116,10 +135,13 @@ class DiscoveryBatch:
     next_checkpoint: DiscoveryCheckpoint | None
     not_modified: bool = False
     connectivity_events: tuple[DiscoveryConnectivityEvent, ...] = ()
+    rejected_messages: tuple[RejectedDiscoveryMessage, ...] = ()
 
     def __post_init__(self) -> None:
         _require_utc("received_at", self.received_at)
-        if self.not_modified and (self.events or self.connectivity_events):
+        if self.not_modified and (
+            self.events or self.connectivity_events or self.rejected_messages
+        ):
             msg = "A not-modified discovery result cannot contain events"
             raise ValueError(msg)
 

@@ -21,6 +21,7 @@ from pump_research.persistence.models import (
     DiscoveryCheckpointState,
     DiscoveryConnectivityEvent,
     DiscoveryEvent,
+    DiscoveryRejectedMessage,
     LifecycleEvent,
     LifecycleEvidenceEvaluation,
     LifecyclePolicy,
@@ -345,6 +346,18 @@ class CollectorRunRepository:
             )
         )
         await session.flush()
+
+
+class DiscoveryRejectedMessageRepository:
+    """Append lossless rejected stream evidence without invoking a JSON serializer."""
+
+    async def record(self, session: AsyncSession, **values: object) -> None:
+        normalized_values = _normalize_timestamp_values(values, ("received_at",))
+        await session.execute(
+            insert(DiscoveryRejectedMessage)
+            .values(**normalized_values)
+            .on_conflict_do_nothing(index_elements=[DiscoveryRejectedMessage.idempotency_key])
+        )
 
 
 class DiscoveryEventRepository:

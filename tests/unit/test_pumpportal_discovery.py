@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Sequence
 from contextlib import AbstractAsyncContextManager
@@ -160,6 +161,10 @@ async def test_valid_new_token_event_maps_to_provider_neutral_contract() -> None
     assert event.received_at == NOW
     assert event.source_payload == payload
     assert len(event.source_payload_sha256) == 64
+    assert event.source_payload_sha256 == hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    ).hexdigest()
+    assert batch.rejected_messages == ()
 
 
 @pytest.mark.asyncio
@@ -289,6 +294,106 @@ def test_blank_api_key_and_embedded_credentials_are_rejected() -> None:
         _settings(pumpportal_api_key="  ")
     with pytest.raises(ValidationError, match="separately"):
         _settings(pumpportal_websocket_url="wss://pumpportal.test/api/data?api-key=secret")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {field: "bad\x00value"}
+        for field in (
+            "name", "symbol", "uri", "image", "website", "twitter", "telegram",
+            "mint", "signature", "timestamp",
+        )
+    ]
+    + [
+        {"unknown": {"deep": [None, 1, {"key": "\x00"}]}},
+        {"unknown": [{"key\x00": "value"}]},
+        {"\x00": "top-level-key"},
+    ],
+)
+@pytest.mark.parametrize("binary", [False, True])
+async def test_nul_anywhere_is_losslessly_quarantined_and_next_event_continues(
+    extra: dict[str, object], binary: bool,
+) -> None:
+    message = json.dumps(_new_token(**extra), ensure_ascii=True, indent=2)
+    wire_message = message.encode() if binary else message
+    good = _new_token(signature="following-good-event")
+    socket = FakeSocket([wire_message, json.dumps(good)])
+    source = PumpPortalDiscoverySource(
+        _settings(pumpportal_batch_size=1),
+        connection_factory=FakeConnectionFactory([socket]), now=lambda: NOW,
+    )
+    try:
+        batch = await source.fetch()
+        assert batch.events == ()
+        rejection, = batch.rejected_messages
+        assert rejection.raw_message == message.encode()
+        assert rejection.raw_message_sha256 == hashlib.sha256(message.encode()).hexdigest()
+        assert rejection.message_encoding == ("binary" if binary else "utf8-surrogatepass")
+        assert rejection.reason_code == "postgresql_nul_string"
+        assert rejection.received_at == NOW
+        assert await source.fetch() is batch
+        await source.acknowledge(batch)
+        following = await source.fetch()
+        assert following.events[0].source_payload == good
+        assert source.metrics.parse_failures == 1
+        assert source.metrics.disconnects == 0
+    finally:
+        await source.aclose()
+
+
+async def test_literal_escape_and_valid_unicode_are_not_quarantined() -> None:
+    payload = _new_token(name="literal \\u0000 and 雪 🌍", extra={"\\u0000": ["\\u0000"]})
+    source = PumpPortalDiscoverySource(
+        _settings(), connection_factory=FakeConnectionFactory([FakeSocket([json.dumps(payload)])]),
+        now=lambda: NOW,
+    )
+    try:
+        batch = await source.fetch()
+        assert batch.events[0].source_payload == payload
+        assert batch.rejected_messages == ()
+    finally:
+        await source.aclose()
+
+
+async def test_quarantine_receipts_and_malformed_message_order_are_preserved() -> None:
+    # Same source message at two distinct receipt times is two pieces of evidence.
+    raw = json.dumps(_new_token(extra="\x00"))
+    source = PumpPortalDiscoverySource(
+        _settings(),
+        connection_factory=FakeConnectionFactory(
+            [FakeSocket([raw, '{"name":"missing mint"}', raw])]
+        ),
+        now=iter(NOW.replace(second=second) for second in range(20)).__next__,
+    )
+    try:
+        first = await source.fetch()
+        assert len(first.rejected_messages) == 1
+        await source.acknowledge(first)
+        with pytest.raises(DiscoveryResponseParseError, match="malformed"):
+            await source.fetch()
+        second = await source.fetch()
+        before, after = first.rejected_messages[0], second.rejected_messages[0]
+        assert before.raw_message_sha256 == after.raw_message_sha256
+        assert before.received_at < after.received_at
+        assert before.idempotency_key != after.idempotency_key
+    finally:
+        await source.aclose()
+
+
+async def test_unpaired_surrogate_is_also_losslessly_quarantined() -> None:
+    raw = json.dumps(_new_token(extra={"\ud800": ["\udfff"]}))
+    source = PumpPortalDiscoverySource(
+        _settings(), connection_factory=FakeConnectionFactory([FakeSocket([raw])]),
+        now=lambda: NOW,
+    )
+    try:
+        batch = await source.fetch()
+        assert batch.events == ()
+        assert batch.rejected_messages[0].reason_code == "postgresql_unpaired_surrogate"
+        assert batch.rejected_messages[0].raw_message == raw.encode()
+    finally:
+        await source.aclose()
 
 
 _SUBSCRIBE_MESSAGE = json.dumps({"method": "subscribeNewToken"}, separators=(",", ":"))

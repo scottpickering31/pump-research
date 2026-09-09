@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import asdict
 from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -17,6 +18,7 @@ from pump_research.discovery.contracts import (
 from pump_research.persistence.repositories import (
     DiscoveryCheckpointRepository,
     DiscoveryConnectivityEventRepository,
+    DiscoveryRejectedMessageRepository,
 )
 
 
@@ -46,6 +48,7 @@ class DiscoveryCoordinator:
         self._admission_sink = admission_sink
         self._checkpoints = DiscoveryCheckpointRepository()
         self._connectivity_events = DiscoveryConnectivityEventRepository()
+        self._rejected_messages = DiscoveryRejectedMessageRepository()
 
     async def run_once(self, *, collector_run_id: uuid.UUID | None = None) -> DiscoveryBatch:
         """Fetch from the durable cursor and atomically commit events plus next cursor."""
@@ -68,8 +71,16 @@ class DiscoveryCoordinator:
         ):
             msg = "Discovery source returned connectivity evidence under another namespace"
             raise ValueError(msg)
+        if any(event.source_name != self._source.source_name for event in batch.rejected_messages):
+            raise ValueError("Discovery source returned rejection evidence under another namespace")
 
         async with self._session_factory() as session, session.begin():
+            for rejected_message in batch.rejected_messages:
+                values = asdict(rejected_message)
+                values["provider"] = values.pop("source_name")
+                await self._rejected_messages.record(
+                    session, **values, collector_run_id=collector_run_id,
+                )
             for discovery_event in batch.events:
                 await self._admission_sink.admit_discovery_in_session(
                     session, discovery_event, collector_run_id

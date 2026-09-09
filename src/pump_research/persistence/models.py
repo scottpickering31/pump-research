@@ -15,6 +15,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    LargeBinary,
     Numeric,
     PrimaryKeyConstraint,
     String,
@@ -283,6 +284,37 @@ class ApiRequestLog(Base):
     response_payload: Mapped[dict[str, object] | None] = mapped_column(JSONB)
     response_payload_sha256: Mapped[str | None] = mapped_column(String(64))
     failure_detail: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+    persisted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class DiscoveryRejectedMessage(Base):
+    """Append-only raw stream messages that cannot safely become JSONB evidence."""
+
+    __tablename__ = "discovery_rejected_messages"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_discovery_rejected_messages_idempotency"),
+        CheckConstraint(
+            "message_encoding IN ('binary', 'utf8-surrogatepass')",
+            name="ck_discovery_rejected_messages_encoding",
+        ),
+        Index("ix_discovery_rejected_messages_provider_received", "provider", "received_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    collector_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("collector_runs.id", ondelete="RESTRICT")
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    endpoint: Mapped[str] = mapped_column(String(256), nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_message: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    message_encoding: Mapped[str] = mapped_column(String(32), nullable=False)
+    raw_message_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     persisted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
