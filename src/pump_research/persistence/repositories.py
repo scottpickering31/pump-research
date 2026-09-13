@@ -29,6 +29,7 @@ from pump_research.persistence.models import (
     Pair,
     Token,
 )
+from pump_research.persistence.normalized_text import bounded_normalized_text
 
 _EPOCH0_ID = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
@@ -195,7 +196,7 @@ class PairRepository:
                 token_id=token_id,
                 chain=chain,
                 address=address,
-                dex_identifier=dex_identifier,
+                dex_identifier=bounded_normalized_text(dex_identifier, 128),
                 first_discovered_at=first_discovered_at,
             )
             .on_conflict_do_nothing(index_elements=[Pair.chain, Pair.address])

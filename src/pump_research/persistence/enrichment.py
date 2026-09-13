@@ -23,6 +23,7 @@ from pump_research.persistence.models import (
     TokenSecuritySnapshot,
     TokenSecurityTask,
 )
+from pump_research.persistence.normalized_text import bounded_normalized_text
 
 _SCHEMA_VERSION = 1
 _BOOST_THRESHOLDS = tuple(Decimal(value) for value in ("1", "10", "100", "1000"))
@@ -106,6 +107,16 @@ class PairFactRepository:
         received_at = _utc(received_at, "received_at")
         content = asdict(fact)
         content_sha256 = canonical_digest(content)
+        # Hash full source-attributed values before bounding display columns:
+        # changes beyond the retained prefix must still append a new fact.
+        normalized_content = {
+            **content,
+            "dex_identifier": bounded_normalized_text(fact.dex_identifier, 128),
+            "base_token_name": bounded_normalized_text(fact.base_token_name, 512),
+            "base_token_symbol": bounded_normalized_text(fact.base_token_symbol, 128),
+            "quote_token_name": bounded_normalized_text(fact.quote_token_name, 512),
+            "quote_token_symbol": bounded_normalized_text(fact.quote_token_symbol, 128),
+        }
         await _lock_scope(session, "pair-fact", pair_id, provider)
         previous = await session.scalar(
             select(PairFactEvent)
@@ -128,7 +139,7 @@ class PairFactRepository:
             "source_record_sha256": source_record_sha256,
             "content_sha256": content_sha256,
             "schema_version": _SCHEMA_VERSION,
-            **content,
+            **normalized_content,
         }
         await session.execute(insert(PairFactEvent).values(**values).on_conflict_do_nothing())
         stored = await session.scalar(
@@ -188,6 +199,19 @@ class TokenMetadataRepository:
         if all(value is None for value in content.values()):
             return None
         content_sha256 = canonical_digest(content)
+        # All metadata producers share this boundary; raw payloads, other_links
+        # and content/idempotency digests keep their existing lossless semantics.
+        normalized_content = {
+            **content,
+            "name": bounded_normalized_text(metadata.name, 512),
+            "symbol": bounded_normalized_text(metadata.symbol, 128),
+            "metadata_uri": bounded_normalized_text(metadata.metadata_uri, 4096),
+            "image_url": bounded_normalized_text(metadata.image_url, 4096),
+            "header_url": bounded_normalized_text(metadata.header_url, 4096),
+            "website_url": bounded_normalized_text(metadata.website_url, 4096),
+            "twitter": bounded_normalized_text(metadata.twitter, 2048),
+            "telegram": bounded_normalized_text(metadata.telegram, 2048),
+        }
         scope_pair = pair_id or "token"
         await _lock_scope(session, "metadata", token_id, provider, source_kind, scope_pair)
         filters = [
@@ -234,7 +258,7 @@ class TokenMetadataRepository:
             "source_record_sha256": source_record_sha256,
             "content_sha256": content_sha256,
             "schema_version": _SCHEMA_VERSION,
-            **content,
+            **normalized_content,
         }
         await session.execute(insert(TokenMetadataEvent).values(**values).on_conflict_do_nothing())
         stored = await session.scalar(

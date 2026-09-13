@@ -276,8 +276,32 @@ class ScheduledObservationWorkflow:
         normalized_pairs: list[NormalizedPair] = []
         observed_token_ids: set[uuid.UUID] = set()
         issues: list[dict[str, object]] = []
+        invalid_identity_indexes: set[int] = set()
+        for index, pair in enumerate(result.pairs):
+            for field, value, maximum in (
+                ("chainId", pair.chain_id, 32),
+                ("pairAddress", pair.pair_address, 128),
+                ("baseToken.address", pair.base_token.address if pair.base_token else None, 128),
+                ("quoteToken.address", pair.quote_token.address if pair.quote_token else None, 128),
+            ):
+                if value is not None and len(value) > maximum:
+                    # Never truncate identity strings into a different token/pair.
+                    # Preserve the complete record in the request, mark partial,
+                    # and continue collecting the other records in this batch.
+                    invalid_identity_indexes.add(index)
+                    issues.append(
+                        {
+                            "kind": "oversized_pair_identity",
+                            "field": field,
+                            "length": len(value),
+                            "max_length": maximum,
+                            "source_record_locator": f"pairs[{index}]",
+                        }
+                    )
         for member in claim.members:
             for index, pair in _pairs_for_address(result.pairs, claim.chain, member.address):
+                if index in invalid_identity_indexes:
+                    continue
                 if pair.pair_address is None:
                     issues.append(
                         {

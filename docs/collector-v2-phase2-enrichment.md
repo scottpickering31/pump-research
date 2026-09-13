@@ -93,6 +93,14 @@ change, under a per-token transaction lock. Returning to an earlier value is sti
 new event because the source request/event is part of its identity. Social platforms are
 not scraped and no follower/engagement metrics are collected.
 
+Normalized names, symbols, DEX identifiers, URLs and social handles retain a Unicode
+prefix fitting their existing column width. Raw source values remain lossless, and
+content digests are computed from full extracted values before bounding columns;
+changes beyond a stored prefix therefore still append a version. Addresses and source
+locators are never truncated. See the [Epoch 14 text-width contract and field audit](
+epoch14-text-width-incident.md) for exact widths, oversized-identity outcomes and raw
+evidence recovery instructions.
+
 ### Token security
 
 At DEX admission, then approximately 1 hour, 24 hours, and 7 days later, query mint
